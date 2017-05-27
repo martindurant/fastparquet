@@ -2,7 +2,9 @@ Usage Notes
 ===========
 
 Some additional information to bear in mind when using fastparquet,
-in no particular order.
+in no particular order. Much of what follows has implications for writing
+parquet files that are compatible with other parquet implementations, versus
+performance when writing data for reading back with fastparquet.
 
 Whilst we aim to make the package simple to use, some choices on the part
 of the user may effect performance and data consistency.
@@ -22,9 +24,13 @@ category type:
 
     df[col] = df[col].astype('category')
 
-To efficiently load a column as a categorical type, include it in the optional
+Fastparquet will automatically use metadata information to load such columns
+as categorical *if* the data was written by fastparquet.
+
+To efficiently load a column as a categorical type for data from other
+parquet frameworks, include it in the optional
 keyword parameter ``categories``; however it must be encoded as dictionary
-throughout the dataset (as it will, if written by fastparquet).
+throughout the dataset.
 
 .. code-block:: python
 
@@ -39,7 +45,8 @@ be de-referenced on load which is potentially expensive.
 
 Note that before loading, it is not possible to know whether the above condition
 will be met, so the ``dtypes`` attribute of a ``ParquetFile`` will show the
-data type appropriate for the values of column and never ``Category``.
+data type appropriate for the values of column, unless the data originates with
+fastparquet.
 
 Byte Arrays
 -----------
@@ -77,32 +84,47 @@ Spark, be sure to transform integer columns to a minimum of 4 bytes (numpy
 Nulls
 -----
 
-In pandas, NULL values are typically represented by the floating point ``NaN``.
+In pandas, there is no internal representation difference between NULL (no value)
+and NaN (not a valid number) for float, time and category columns. Whether to
+enocde these values using parquet NULL or the "sentinel" values is a choice for
+the user. The parquet framework that will read the data will likely treat
+NULL and NaN differently (e.g., in `in Spark`_). In the typical case of tabular
+data (as opposed to strict numerics), users often mean the NULL semantics, and
+so should write NULLs information. Furthermore, it is typical for some parquet
+frameworks to define all columns as optional, whether or not they are intended to
+hold any missing data, to allow for possible mutation of the schema when appending
+partitions later.
+
+.. _in Spark: https://spark.apache.org/docs/2.1.0/sql-programming-guide.html#nan-semantics
+
+Since there is some cost associated with reading and writing NULLs information,
+fastparquet provides the ``has_nulls`` keyword when writing to specify how to
+handle NULLs. In the case that a column has no NULLs, including NULLs information
+will not produce a great performance hit on reading, and only a slight extra time
+upon writing, while determining that there are zero NULL values.
+
+The following cases are allowed for ``has_nulls``:
+
+    - True: all columns become optional, and NaNs are always stored as NULL. This is
+      the best option for compatibility. This is the default.
+
+    - False: all columns become required, and any NaNs are stored as NaN; if there
+      are any fields which cannot store such sentinel values (e.g,. string),
+      but do contain None, there will be an error.
+
+    - 'infer': only object columns will become optional, since float, time, and
+      category columns can store sentinel values, and pandas int columns cannot
+      contain any NaNs. This is the best-performing
+      option if the data will only be read by fastparquet.
+
+    - list of strings: the named columns will be optional, others required (no NULLs)
+
 This value can be stored in float and time fields, and will be read back such
 that the original data is recovered. They are not, however, the same thing
 as missing values, and if querying the resultant files using other frameworks,
 this should be born in mind. With ``has_nulls=None`` (the default) on writing,
-float and time fields will not write separate NULLs information, and
+float, time and category fields will not write separate NULLs information, and
 the metadata will give num_nulls=0.
-
-Using ``has_nulls=True`` (which can
-also be specified for some specific subset of columns using a list) will force
-the writing of NULLs information, making the output more transferable, but
-comes with a performance penalty.
-
-Because of the ``NaN`` encoding for NULLs, pandas is unable to represent missing
-data in an integer field. In practice, this means that fastparquet will never
-write any NULLs in an integer field, and if reading an integer field with NULLs,
-the resultant column will become a float type. This is in line with what
-pandas does when reading integers.
-
-For object and category columns, NULLs (``None``) do exist, and fastparquet can
-read and write them. Including this data does come at a cost, however.
-Currently, with ``has_nulls=None`` (the default), object fields will assume
-the existence of NULLs; if a chunk does not in fact have any, then skipping
-their decoding will be pretty efficient. In general, it is best to provide
-``has_nulls`` with a list of columns known to contain NULLs - however if None
-is encountered in a column not in the list, this will raise an exception.
 
 
 Data Types

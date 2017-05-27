@@ -13,18 +13,10 @@ import shutil
 import tempfile
 
 from fastparquet.util import tempdir, default_mkdirs
-from fastparquet.test.test_read import s3
+from fastparquet.test.util import s3, sql
 from fastparquet.compression import compressions
 
 TEST_DATA = "test-data"
-
-
-@pytest.fixture()
-def sql():
-    pyspark = pytest.importorskip("pyspark")
-    sc = pyspark.SparkContext.getOrCreate()
-    sql = pyspark.SQLContext(sc)
-    return sql
 
 
 def test_uvarint():
@@ -82,43 +74,6 @@ def test_rle_bp():
         assert (out.so_far()[:len(values)] == values).all()
 
 
-@pytest.mark.parametrize('scheme', ['simple', 'hive'])
-@pytest.mark.parametrize('row_groups', [[0], [0, 500]])
-@pytest.mark.parametrize('comp', [None] + list(compressions))
-def test_pyspark_roundtrip(tempdir, scheme, row_groups, comp, sql):
-    if comp == 'BROTLI':
-        pytest.xfail("spark doesn't support BROTLI compression")
-    data = pd.DataFrame({'i32': np.random.randint(-2**17, 2**17, size=1001,
-                                                  dtype=np.int32),
-                         'i64': np.random.randint(-2**33, 2**33, size=1001,
-                                                  dtype=np.int64),
-                         'f': np.random.randn(1001),
-                         'bhello': np.random.choice([b'hello', b'you',
-                            b'people'], size=1001).astype("O"),
-                         't': [datetime.datetime.now()]*1001})
-
-    data['t'] += pd.to_timedelta('1ns')
-    data['hello'] = data.bhello.str.decode('utf8')
-    data.loc[100, 'f'] = np.nan
-    data['bcat'] = data.bhello.astype('category')
-    data['cat'] = data.hello.astype('category')
-
-    fname = os.path.join(tempdir, 'test.parquet')
-    write(fname, data, file_scheme=scheme, row_group_offsets=row_groups,
-          compression=comp, times='int96', write_index=True)
-
-    df = sql.read.parquet(fname)
-    ddf = df.sort('index').toPandas()
-    for col in data:
-        if data[col].dtype.kind == "M":
-            # pyspark auto-converts timezones
-            offset = round((datetime.datetime.utcnow() -
-                            datetime.datetime.now()).seconds / 3600)
-            ddf[col] + datetime.timedelta(hours=offset) == data[col]
-        else:
-            assert (ddf[col] == data[col])[~ddf[col].isnull()].all()
-
-
 def test_roundtrip_s3(s3):
     data = pd.DataFrame({'i32': np.arange(1000, dtype=np.int32),
                          'i64': np.arange(1000, dtype=np.int64),
@@ -172,7 +127,7 @@ def test_roundtrip(tempdir, scheme, row_groups, comp):
 def test_bad_coltype(tempdir):
     df = pd.DataFrame({'0': [1, 2], (0, 1): [3, 4]})
     fn = os.path.join(tempdir, 'temp.parq')
-    with pytest.raises(ValueError) as e:
+    with pytest.raises((ValueError, TypeError)) as e:
         write(fn, df)
         assert "tuple" in str(e)
 
@@ -330,29 +285,52 @@ def test_int_rowgroups(tempdir):
     assert [rg.num_rows for rg in r.row_groups] == [34, 34, 32]
 
 
-def test_groups_roundtrip(tempdir):
+@pytest.mark.parametrize('scheme', ['hive', 'drill'])
+def test_groups_roundtrip(tempdir, scheme):
     df = pd.DataFrame({'a': np.random.choice(['a', 'b', None], size=1000),
                        'b': np.random.randint(0, 64000, size=1000),
                        'c': np.random.choice([True, False], size=1000)})
-    writer.write(tempdir, df, partition_on=['a', 'c'], file_scheme='hive')
+    writer.write(tempdir, df, partition_on=['a', 'c'], file_scheme=scheme)
 
     r = ParquetFile(tempdir)
     assert r.columns == ['b']
     out = r.to_pandas()
+    if scheme == 'drill':
+        assert set(r.cats) == {'dir0', 'dir1'}
+        assert set(out.columns) == {'b', 'dir0', 'dir1'}
+        out.rename(columns={'dir0': 'a', 'dir1': 'c'}, inplace=True)
 
     for i, row in out.iterrows():
-        assert row.b in list(df[(df.a==row.a)&(df.c==row.c)].b)
+        assert row.b in list(df[(df.a == row.a) & (df.c == row.c)].b)
 
     writer.write(tempdir, df, row_group_offsets=[0, 50], partition_on=['a', 'c'],
-                 file_scheme='hive')
+                 file_scheme=scheme)
 
     r = ParquetFile(tempdir)
     assert r.count == sum(~df.a.isnull())
     assert len(r.row_groups) == 8
     out = r.to_pandas()
 
+    if scheme == 'drill':
+        assert set(out.columns) == {'b', 'dir0', 'dir1'}
+        out.rename(columns={'dir0': 'a', 'dir1': 'c'}, inplace=True)
     for i, row in out.iterrows():
         assert row.b in list(df[(df.a==row.a)&(df.c==row.c)].b)
+
+
+def test_groups_iterable(tempdir):
+    df = pd.DataFrame({'a': np.random.choice(['aaa', 'bbb', None], size=1000),
+                       'b': np.random.randint(0, 64000, size=1000),
+                       'c': np.random.choice([True, False], size=1000)})
+    writer.write(tempdir, df, partition_on=['a'], file_scheme='hive')
+
+    r = ParquetFile(tempdir)
+    assert r.columns == ['b', 'c']
+    out = r.to_pandas()
+
+    for i, row in out.iterrows():
+        assert row.b in list(df[(df.a==row.a)&(df.c==row.c)].b)
+
 
 
 def test_empty_groupby(tempdir):
@@ -403,6 +381,7 @@ def test_write_compression_schema(tempdir):
 
 
 def test_index(tempdir):
+    import json
     fn = os.path.join(tempdir, 'tmp.parq')
     df = pd.DataFrame({'x': [1, 2, 3],
                        'y': [1., 2., 3.]},
@@ -410,8 +389,36 @@ def test_index(tempdir):
 
     writer.write(fn, df)
 
-    r = ParquetFile(fn)
-    assert set(r.columns) == {'x', 'y', 'z'}
+    pf = ParquetFile(fn)
+    assert set(pf.columns) == {'x', 'y', 'z'}
+    meta = json.loads(pf.key_value_metadata['pandas'])
+    assert meta['index_columns'] == ['z']
+    out = pf.to_pandas()
+    assert out.index.name == 'z'
+    pd.util.testing.assert_frame_equal(df, out)
+    out = pf.to_pandas(index=False)
+    assert out.index.name is None
+    assert (out.index == range(3)).all()
+    assert (out.z == df.index).all()
+
+
+def test_duplicate_columns(tempdir):
+    fn = os.path.join(tempdir, 'tmp.parq')
+    df = pd.DataFrame(np.arange(12).reshape(4, 3), columns=list('aaa'))
+    with pytest.raises(ValueError) as e:
+        write(fn, df)
+    assert 'duplicate' in str(e)
+
+
+def test_dotted_column(tempdir):
+    fn = os.path.join(tempdir, 'tmp.parq')
+    df = pd.DataFrame({'x.y': [1, 2, 3],
+                       'y': [1., 2., 3.]})
+
+    writer.write(fn, df)
+
+    out = ParquetFile(fn).to_pandas()
+    assert list(out.columns) == ['x.y', 'y']
 
 
 def test_naive_index(tempdir):
@@ -437,26 +444,26 @@ def test_text_convert(tempdir):
 
     write(fn, df, fixed_text={'a': 2, 'b': 1})
     pf = ParquetFile(fn)
-    assert pf.schema[1].type == parquet_thrift.Type.FIXED_LEN_BYTE_ARRAY
-    assert pf.schema[1].type_length == 2
-    assert pf.schema[2].type == parquet_thrift.Type.FIXED_LEN_BYTE_ARRAY
-    assert pf.schema[2].type_length == 1
+    assert pf._schema[1].type == parquet_thrift.Type.FIXED_LEN_BYTE_ARRAY
+    assert pf._schema[1].type_length == 2
+    assert pf._schema[2].type == parquet_thrift.Type.FIXED_LEN_BYTE_ARRAY
+    assert pf._schema[2].type_length == 1
     assert pf.statistics['max']['a'] == [u'π']
     df2 = pf.to_pandas()
     tm.assert_frame_equal(df, df2, check_categorical=False)
 
     write(fn, df)
     pf = ParquetFile(fn)
-    assert pf.schema[1].type == parquet_thrift.Type.BYTE_ARRAY
-    assert pf.schema[2].type == parquet_thrift.Type.BYTE_ARRAY
+    assert pf._schema[1].type == parquet_thrift.Type.BYTE_ARRAY
+    assert pf._schema[2].type == parquet_thrift.Type.BYTE_ARRAY
     assert pf.statistics['max']['a'] == [u'π']
     df2 = pf.to_pandas()
     tm.assert_frame_equal(df, df2, check_categorical=False)
 
     write(fn, df, fixed_text={'a': 2})
     pf = ParquetFile(fn)
-    assert pf.schema[1].type == parquet_thrift.Type.FIXED_LEN_BYTE_ARRAY
-    assert pf.schema[2].type == parquet_thrift.Type.BYTE_ARRAY
+    assert pf._schema[1].type == parquet_thrift.Type.FIXED_LEN_BYTE_ARRAY
+    assert pf._schema[2].type == parquet_thrift.Type.BYTE_ARRAY
     assert pf.statistics['max']['a'] == [u'π']
     df2 = pf.to_pandas()
     tm.assert_frame_equal(df, df2, check_categorical=False)
@@ -486,10 +493,17 @@ def test_null_time(tempdir):
 def test_auto_null(tempdir):
     tmp = str(tempdir)
     df = pd.DataFrame({'a': [1, 2, 3, 0],
+                       'aa': [1, 2, 3, None],
                        'b': [1., 2., 3., np.nan],
                        'c': pd.to_timedelta([1, 2, 3, np.nan], unit='ms'),
-                       'd': ['a', 'b', 'c', None]})
+                       'd': ['a', 'b', 'c', None],
+                       'f': [True, False, True, True],
+                       'ff': [True, False, None, True]})
     df['e'] = df['d'].astype('category')
+    df['bb'] = df['b'].astype('object')
+    df['aaa'] = df['a'].astype('object')
+    object_cols = ['d', 'ff', 'bb', 'aaa']
+    test_cols = list(set(df) - set(object_cols)) + ['d']
     fn = os.path.join(tmp, "test.parq")
 
     with pytest.raises((TypeError, AttributeError)):
@@ -498,19 +512,54 @@ def test_auto_null(tempdir):
 
     write(fn, df, has_nulls=True)
     pf = ParquetFile(fn)
-    for col in pf.schema[2:]:
+    for col in pf._schema[1:]:
         assert col.repetition_type == parquet_thrift.FieldRepetitionType.OPTIONAL
-    assert pf.schema[1].repetition_type == parquet_thrift.FieldRepetitionType.REQUIRED
     df2 = pf.to_pandas(categories=['e'])
-    tm.assert_frame_equal(df, df2, check_categorical=False)
 
+    tm.assert_frame_equal(df[test_cols], df2[test_cols], check_categorical=False)
+    tm.assert_frame_equal(df[['ff']].astype('float16'), df2[['ff']])
+    tm.assert_frame_equal(df[['bb']].astype('float64'), df2[['bb']])
+    tm.assert_frame_equal(df[['aaa']].astype('int64'), df2[['aaa']])
+
+    # not giving any value same as has_nulls=True
+    write(fn, df)
+    pf = ParquetFile(fn)
+    for col in pf._schema[1:]:
+        assert col.repetition_type == parquet_thrift.FieldRepetitionType.OPTIONAL
+    df2 = pf.to_pandas(categories=['e'])
+
+    tm.assert_frame_equal(df[test_cols], df2[test_cols], check_categorical=False)
+    tm.assert_frame_equal(df[['ff']].astype('float16'), df2[['ff']])
+    tm.assert_frame_equal(df[['bb']].astype('float64'), df2[['bb']])
+    tm.assert_frame_equal(df[['aaa']].astype('int64'), df2[['aaa']])
+
+    # 'infer' is new recommended auto-null
+    write(fn, df, has_nulls='infer')
+    pf = ParquetFile(fn)
+    for col in pf._schema[1:]:
+        if col.name in object_cols:
+            assert col.repetition_type == parquet_thrift.FieldRepetitionType.OPTIONAL
+        else:
+            assert col.repetition_type == parquet_thrift.FieldRepetitionType.REQUIRED
+    df2 = pf.to_pandas()
+    tm.assert_frame_equal(df[test_cols], df2[test_cols], check_categorical=False)
+    tm.assert_frame_equal(df[['ff']].astype('float16'), df2[['ff']])
+    tm.assert_frame_equal(df[['bb']].astype('float64'), df2[['bb']])
+    tm.assert_frame_equal(df[['aaa']].astype('int64'), df2[['aaa']])
+
+    # nut legacy None still works
     write(fn, df, has_nulls=None)
     pf = ParquetFile(fn)
-    for col in pf.schema[1:3]:
-        assert col.repetition_type == parquet_thrift.FieldRepetitionType.REQUIRED
-    assert pf.schema[4].repetition_type == parquet_thrift.FieldRepetitionType.OPTIONAL
-    df2= pf.to_pandas(categories=['e'])
-    tm.assert_frame_equal(df, df2, check_categorical=False)
+    for col in pf._schema[1:]:
+        if col.name in object_cols:
+            assert col.repetition_type == parquet_thrift.FieldRepetitionType.OPTIONAL
+        else:
+            assert col.repetition_type == parquet_thrift.FieldRepetitionType.REQUIRED
+    df2 = pf.to_pandas()
+    tm.assert_frame_equal(df[test_cols], df2[test_cols], check_categorical=False)
+    tm.assert_frame_equal(df[['ff']].astype('float16'), df2[['ff']])
+    tm.assert_frame_equal(df[['bb']].astype('float64'), df2[['bb']])
+    tm.assert_frame_equal(df[['aaa']].astype('int64'), df2[['aaa']])
 
 
 @pytest.mark.parametrize('n', (10, 127, 2**8 + 1, 2**16 + 1))
@@ -534,6 +583,42 @@ def test_many_categories(tempdir, n):
 
     assert (out.index == df.index).all()
     assert (out.y == df.y).all()
+
+
+def test_autocat(tempdir):
+    tmp = str(tempdir)
+    fn = os.path.join(tmp, "test.parq")
+    data = pd.DataFrame({'o': pd.Categorical(
+        np.random.choice(['hello', 'world'], size=1000))})
+    write(fn, data)
+    pf = ParquetFile(fn)
+    assert 'o' in pf.categories
+    assert pf.categories['o'] == 2
+    assert pf.dtypes['o'] == 'category'
+    out = pf.to_pandas()
+    assert out.dtypes['o'] == 'category'
+    out = pf.to_pandas(categories={})
+    assert str(out.dtypes['o']) != 'category'
+    out = pf.to_pandas(categories=['o'])
+    assert out.dtypes['o'] == 'category'
+    out = pf.to_pandas(categories={'o': 2})
+    assert out.dtypes['o'] == 'category'
+
+    # regression test
+    pf.fmd.key_value_metadata = [parquet_thrift.KeyValue(
+        key='fastparquet.cats', value='{"o": 2}')]
+    pf._set_attrs()
+    assert 'o' in pf.categories
+    assert pf.categories['o'] == 2
+    assert pf.dtypes['o'] == 'category'
+    out = pf.to_pandas()
+    assert out.dtypes['o'] == 'category'
+    out = pf.to_pandas(categories={})
+    assert str(out.dtypes['o']) != 'category'
+    out = pf.to_pandas(categories=['o'])
+    assert out.dtypes['o'] == 'category'
+    out = pf.to_pandas(categories={'o': 2})
+    assert out.dtypes['o'] == 'category'
 
 
 @pytest.mark.parametrize('row_groups', ([0], [0, 2]))
@@ -694,9 +779,38 @@ def test_hasnulls_ordering(tempdir):
     writer.write(fname, data, has_nulls=['a', 'c'])
 
     r = ParquetFile(fname)
-    assert r.schema[1].name == 'a'
-    assert r.schema[1].repetition_type == 1
-    assert r.schema[2].name == 'b'
-    assert r.schema[2].repetition_type == 0
-    assert r.schema[3].name == 'c'
-    assert r.schema[3].repetition_type == 1
+    assert r._schema[1].name == 'a'
+    assert r._schema[1].repetition_type == 1
+    assert r._schema[2].name == 'b'
+    assert r._schema[2].repetition_type == 0
+    assert r._schema[3].name == 'c'
+    assert r._schema[3].repetition_type == 1
+
+
+def test_cats_in_part_files(tempdir):
+    df = pd.DataFrame({'a': pd.Categorical(['a', 'b'] * 100)})
+    writer.write(tempdir, df, file_scheme='hive', row_group_offsets=50)
+    import glob
+    files = glob.glob(os.path.join(tempdir, 'part*'))
+    pf = ParquetFile(tempdir)
+    assert len(pf.row_groups) == 4
+    kv = pf.fmd.key_value_metadata
+    assert kv
+    for f in files:
+        pf = ParquetFile(f)
+        assert pf.fmd.key_value_metadata == kv
+        assert len(pf.row_groups) == 1
+    out = pd.concat([ParquetFile(f).to_pandas() for f in files],
+                    ignore_index=True)
+    pd.util.testing.assert_frame_equal(df, out)
+
+
+def test_cats_and_nulls(tempdir):
+    df = pd.DataFrame({'x': pd.Categorical([1, 2, 1])})
+    fn = os.path.join(tempdir, 'temp.parq')
+    write(fn, df)
+    pf = ParquetFile(fn)
+    assert not pf.schema.is_required('x')
+    out = pf.to_pandas()
+    assert out.dtypes['x'] == 'category'
+    assert out.x.tolist() == [1, 2, 1]

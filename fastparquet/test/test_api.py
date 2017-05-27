@@ -120,6 +120,31 @@ def test_attributes(tempdir):
         assert pf.dtypes[col] == df.dtypes[col]
 
 
+def test_cast_index(tempdir):
+    df = pd.DataFrame({'i8': np.array([1, 2, 3, 4], dtype='uint8'),
+                       'i16': np.array([1, 2, 3, 4], dtype='int16'),
+                       'i32': np.array([1, 2, 3, 4], dtype='int32'),
+                       'i62': np.array([1, 2, 3, 4], dtype='int64'),
+                       'f16': np.array([1, 2, 3, 4], dtype='float16'),
+                       'f32': np.array([1, 2, 3, 4], dtype='float32'),
+                       'f64': np.array([1, 2, 3, 4], dtype='float64'),
+                       })
+    fn = os.path.join(tempdir, 'foo.parquet')
+    write(fn, df)
+    pf = ParquetFile(fn)
+    for col in list(df):
+        d = pf.to_pandas(index=col)
+        if d.index.dtype.kind == 'i':
+            assert d.index.dtype == 'int64'
+        elif d.index.dtype.kind == 'u':
+            # new UInt64Index
+            assert pd.__version__ >= '0.20'
+            assert d.index.dtype == 'uint64'
+        else:
+            assert d.index.dtype == 'float64'
+        assert (d.index == df[col]).all()
+
+
 def test_zero_child_leaf(tempdir):
     df = pd.DataFrame({'x': [1, 2, 3]})
 
@@ -129,7 +154,7 @@ def test_zero_child_leaf(tempdir):
     pf = ParquetFile(fn)
     assert pf.columns == ['x']
 
-    pf.schema[1].num_children = 0
+    pf._schema[1].num_children = 0
     assert pf.columns == ['x']
 
 
@@ -149,8 +174,35 @@ def test_read_multiple_no_metadata(tempdir):
     write(tempdir, df, file_scheme='hive', row_group_offsets=[0, 2])
     os.unlink(os.path.join(tempdir, '_metadata'))
     import glob
-    flist = glob.glob(os.path.join(tempdir, '*'))
+    flist = list(sorted(glob.glob(os.path.join(tempdir, '*'))))
     pf = ParquetFile(flist)
     assert len(pf.row_groups) == 2
     out = pf.to_pandas()
     pd.util.testing.assert_frame_equal(out, df)
+
+
+def test_filter_without_paths(tempdir):
+    fn = os.path.join(tempdir, 'test.parq')
+    df = pd.DataFrame({
+        'x': [1, 2, 3, 4, 5, 6, 7],
+        'letter': ['a', 'b', 'c', 'd', 'e', 'f', 'g']
+    })
+    write(fn, df)
+
+    pf = ParquetFile(fn)
+    out = pf.to_pandas(filters=[['x', '>', 3]])
+    pd.util.testing.assert_frame_equal(out, df)
+    out = pf.to_pandas(filters=[['x', '>', 30]])
+    assert len(out) == 0
+
+
+def test_filter_special(tempdir):
+    df = pd.DataFrame({
+        'x': [1, 2, 3, 4, 5, 6, 7],
+        'symbol': ['NOW', 'OI', 'OI', 'OI', 'NOW', 'NOW', 'OI']
+    })
+    write(tempdir, df, file_scheme='hive', partition_on=['symbol'])
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas(filters=[('symbol', '==', 'NOW')])
+    assert out.x.tolist() == [1, 5, 6]
+    assert out.symbol.tolist() == ['NOW', 'NOW', 'NOW']

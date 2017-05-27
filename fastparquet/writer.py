@@ -14,16 +14,16 @@ import warnings
 
 import numba
 
-from thriftpy.protocol.compact import TCompactProtocolFactory
+from thriftpy.protocol.compact import TCompactProtocol
 from thriftpy.protocol.exc import TProtocolException
-from .thrift_filetransport import TFileTransport
 from .thrift_structures import parquet_thrift
 from .compression import compress_data, decompress_data
 from .converted_types import tobson
 from . import encoding, api
 from .util import (default_open, default_mkdirs, sep_from_open,
                    ParquetException, thrift_copy, index_like, PY2, STR_TYPE,
-                   check_column_names, metadata_from_many, created_by)
+                   check_column_names, metadata_from_many, created_by,
+                   get_column_metadata)
 from .speedups import array_encode_utf8, pack_byte_array
 
 MARKER = b'PAR1'
@@ -47,7 +47,8 @@ typemap = {  # primitive type, converted type, bit width
 
 revmap = {parquet_thrift.Type.INT32: np.int32,
           parquet_thrift.Type.INT64: np.int64,
-          parquet_thrift.Type.FLOAT: np.float32}
+          parquet_thrift.Type.FLOAT: np.float32,
+          parquet_thrift.Type.DOUBLE: np.float64}
 
 
 def find_type(data, fixed_text=None, object_encoding=None, times='int64'):
@@ -67,9 +68,9 @@ def find_type(data, fixed_text=None, object_encoding=None, times='int64'):
     fixed_text: int or None
         For str and bytes, the fixed-string length to use. If None, object
         column will remain variable length.
-    object_encoding: None or bytes|utf8\json|bson
+    object_encoding: None or infer|bytes|utf8|json|bson|bool|int|float
         How to encode object type into bytes. If None, bytes is assumed;
-        if 'infer'
+        if 'infer', type is guessed from 10 first non-null values.
     times: 'int64'|'int96'
         Normal integers or 12-byte encoding for timestamps.
 
@@ -80,7 +81,6 @@ def find_type(data, fixed_text=None, object_encoding=None, times='int64'):
     - converted data (None if convert is False)
 
     """
-    out = None
     dtype = data.dtype
     if dtype.name in typemap:
         type, converted_type, width = typemap[dtype.name]
@@ -93,18 +93,32 @@ def find_type(data, fixed_text=None, object_encoding=None, times='int64'):
 
         if object_encoding == 'utf8':
             type, converted_type, width = (parquet_thrift.Type.BYTE_ARRAY,
-                                           parquet_thrift.ConvertedType.UTF8, None)
+                                           parquet_thrift.ConvertedType.UTF8,
+                                           None)
         elif object_encoding in ['bytes', None]:
-            type, converted_type, width = parquet_thrift.Type.BYTE_ARRAY, None, None
+            type, converted_type, width = (parquet_thrift.Type.BYTE_ARRAY, None,
+                                           None)
         elif object_encoding == 'json':
             type, converted_type, width = (parquet_thrift.Type.BYTE_ARRAY,
-                                           parquet_thrift.ConvertedType.JSON, None)
+                                           parquet_thrift.ConvertedType.JSON,
+                                           None)
         elif object_encoding == 'bson':
             type, converted_type, width = (parquet_thrift.Type.BYTE_ARRAY,
-                                           parquet_thrift.ConvertedType.BSON, None)
+                                           parquet_thrift.ConvertedType.BSON,
+                                           None)
+        elif object_encoding == 'bool':
+            type, converted_type, width = (parquet_thrift.Type.BOOLEAN, None,
+                                           1)
+        elif object_encoding == 'int':
+            type, converted_type, width = (parquet_thrift.Type.INT64, None,
+                                           64)
+        elif object_encoding == 'float':
+            type, converted_type, width = (parquet_thrift.Type.DOUBLE, None,
+                                           64)
         else:
             raise ValueError('Object encoding (%s) not one of '
-                             'infer|utf8|bytes|json|bson' % object_encoding)
+                             'infer|utf8|bytes|json|bson|bool|int|float' %
+                             object_encoding)
         if fixed_text:
             width = fixed_text
             type = parquet_thrift.Type.FIXED_LEN_BYTE_ARRAY
@@ -153,7 +167,14 @@ def convert(data, se):
         if converted_type == parquet_thrift.ConvertedType.UTF8:
             out = array_encode_utf8(data)
         elif converted_type is None:
-            out = data.values
+            if type in revmap:
+                out = data.values.astype(revmap[type], copy=False)
+            elif type == parquet_thrift.Type.BOOLEAN:
+                padded = np.lib.pad(data.values, (0, 8 - (len(data) % 8)),
+                                    'constant', constant_values=(0, 0))
+                out = np.packbits(padded.reshape(-1, 8)[:, ::-1].ravel())
+            else:
+                out = data.values
         elif converted_type == parquet_thrift.ConvertedType.JSON:
             out = np.array([json.dumps(x).encode('utf8') for x in data],
                            dtype="O")
@@ -183,14 +204,23 @@ def infer_object_encoding(data):
     head = data[:10] if isinstance(data, pd.Index) else data.valid()[:10]
     if all(isinstance(i, STR_TYPE) for i in head) and not PY2:
         return "utf8"
-    if PY2 and all(isinstance(i, unicode) for i in head):
+    elif PY2 and all(isinstance(i, unicode) for i in head):
         return "utf8"
-    if all(isinstance(i, STR_TYPE) for i in head) and PY2:
+    elif all(isinstance(i, STR_TYPE) for i in head) and PY2:
         return "bytes"
-    if all(isinstance(i, bytes) for i in head):
+    elif all(isinstance(i, bytes) for i in head):
         return 'bytes'
-    if all(isinstance(i, (list, dict)) for i in head):
+    elif all(isinstance(i, (list, dict)) for i in head):
         return 'json'
+    elif all(isinstance(i, bool) for i in head):
+        return 'bool'
+    elif all(isinstance(i, int) for i in head):
+        return 'int'
+    elif all(isinstance(i, float) or isinstance(i, np.floating)
+             for i in head):
+        # You need np.floating here for pandas NaNs in object
+        # columns with python floats.
+        return 'float'
     else:
         raise ValueError("Can't infer object conversion type: %s" % head)
 
@@ -217,8 +247,7 @@ def write_thrift(fobj, thrift):
     Number of bytes written
     """
     t0 = fobj.tell()
-    tout = TFileTransport(fobj)
-    pout = TCompactProtocolFactory().get_protocol(tout)
+    pout = TCompactProtocol(fobj)
     try:
         thrift.write(pout)
         fail = False
@@ -427,11 +456,16 @@ def write_column(f, data, selement, compression=None):
     if has_nulls:
         if str(data.dtype) == 'category':
             num_nulls = (data.cat.codes == -1).sum()
-        elif data.dtype.kind == 'i':
+        elif data.dtype.kind in ['i', 'b']:
             num_nulls = 0
         else:
             num_nulls = len(data) - data.count()
         definition_data, data = make_definitions(data, num_nulls == 0)
+        if data.dtype.kind == "O" and str(data.dtype) != 'category':
+            if selement.type == parquet_thrift.Type.INT64:
+                data = data.astype(int)
+            elif selement.type == parquet_thrift.Type.BOOLEAN:
+                data = data.astype(bool)
     else:
         definition_data = b""
         num_nulls = 0
@@ -572,40 +606,57 @@ def make_row_group(f, data, schema, compression=None):
     return rg
 
 
-def make_part_file(f, data, schema, compression=None):
+def make_part_file(f, data, schema, compression=None, fmd=None):
     if len(data) == 0:
         return
     with f as f:
         f.write(MARKER)
         rg = make_row_group(f, data, schema, compression=compression)
-        fmd = parquet_thrift.FileMetaData(num_rows=len(data),
-                                          schema=schema,
-                                          version=1,
-                                          created_by=created_by,
-                                          row_groups=[rg])
-        foot_size = write_thrift(f, fmd)
-        f.write(struct.pack(b"<i", foot_size))
+        if fmd is None:
+            fmd = parquet_thrift.FileMetaData(num_rows=len(data),
+                                              schema=schema,
+                                              version=1,
+                                              created_by=created_by,
+                                              row_groups=[rg])
+            foot_size = write_thrift(f, fmd)
+            f.write(struct.pack(b"<i", foot_size))
+        else:
+            prev = fmd.row_groups
+            fmd.row_groups = [rg]
+            foot_size = write_thrift(f, fmd)
+            f.write(struct.pack(b"<i", foot_size))
+            fmd.row_groups = prev
         f.write(MARKER)
     return rg
 
 
 def make_metadata(data, has_nulls=True, ignore_columns=[], fixed_text=None,
-                  object_encoding=None, times='int64'):
+                  object_encoding=None, times='int64', index_cols=[]):
+    if not data.columns.is_unique:
+        raise ValueError('Cannot create parquet dataset with duplicate'
+                         ' column names (%s)' % data.columns)
+    pandas_metadata = {'index_columns': index_cols,
+                       'columns': [], 'pandas_version': pd.__version__}
     root = parquet_thrift.SchemaElement(name='schema',
                                         num_children=0)
 
+    meta = parquet_thrift.KeyValue()
+    meta.key = 'pandas'
     fmd = parquet_thrift.FileMetaData(num_rows=len(data),
                                       schema=[root],
                                       version=1,
                                       created_by=created_by,
-                                      row_groups=[])
+                                      row_groups=[],
+                                      key_value_metadata=[meta])
 
     object_encoding = object_encoding or {}
     for column in data.columns:
         if column in ignore_columns:
             continue
-        oencoding = (object_encoding if isinstance(object_encoding, STR_TYPE) else
-                     object_encoding.get(column, None))
+        pandas_metadata['columns'].append(
+            get_column_metadata(data[column], column))
+        oencoding = (object_encoding if isinstance(object_encoding, STR_TYPE)
+                     else object_encoding.get(column, None))
         fixed = None if fixed_text is None else fixed_text.get(column, None)
         if str(data[column].dtype) == 'category':
             se, type = find_type(data[column].cat.categories,
@@ -616,14 +667,14 @@ def make_metadata(data, has_nulls=True, ignore_columns=[], fixed_text=None,
                                  object_encoding=oencoding, times=times)
         col_has_nulls = has_nulls
         if has_nulls is None:
-            se.repetition_type = type in [parquet_thrift.Type.BYTE_ARRAY,
-                                          parquet_thrift.Type.INT96]
+            se.repetition_type = data[column].dtype == "O"
         elif has_nulls is not True and has_nulls is not False:
             col_has_nulls = column in has_nulls
-        if col_has_nulls and data[column].dtype.kind != 'i':
+        if col_has_nulls:
             se.repetition_type = parquet_thrift.FieldRepetitionType.OPTIONAL
         fmd.schema.append(se)
         root.num_children += 1
+    meta.value = json.dumps(pandas_metadata)
     return fmd
 
 
@@ -663,7 +714,7 @@ def write_simple(fn, data, fmd, row_group_offsets, compression,
 
 def write(filename, data, row_group_offsets=50000000,
           compression=None, file_scheme='simple', open_with=default_open,
-          mkdirs=default_mkdirs, has_nulls=None, write_index=None,
+          mkdirs=default_mkdirs, has_nulls=True, write_index=None,
           partition_on=[], fixed_text=None, append=False,
           object_encoding='infer', times='int64'):
     """ Write Pandas DataFrame to filename as Parquet Format
@@ -692,13 +743,13 @@ def write(filename, data, row_group_offsets=50000000,
         When called with a path/URL, creates any necessary dictionaries to
         make that location writable, e.g., ``os.makedirs``. This is not
         necessary if using the simple file scheme
-    has_nulls: None, bool or list of strings
+    has_nulls: bool, 'infer' or list of strings
         Whether columns can have nulls. If a list of strings, those given
         columns will be marked as "optional" in the metadata, and include
         null definition blocks on disk. Some data types (floats and times)
         can instead use the sentinel values NaN and NaT, which are not the same
         as NULL in parquet, but functionally act the same in many cases,
-        particularly if converting back to pandas later. A value of None
+        particularly if converting back to pandas later. A value of 'infer'
         will assume nulls for object columns and not otherwise.
     write_index: boolean
         Whether or not to write the index to a separate column.  By default we
@@ -719,10 +770,10 @@ def write(filename, data, row_group_offsets=50000000,
         and the schema must match the input data.
     object_encoding: str or {col: type}
         For object columns, this gives the data type, so that the values can
-        be encoded to bytes. Possible values are bytes|utf8|json|bson, where
-        bytes is assumed if not specified (i.e., no conversion). The special
-        value 'infer' will cause the type to be guessed from the first ten
-        values.
+        be encoded to bytes. Possible values are bytes|utf8|json|bson|bool|int,
+        where bytes is assumed if not specified (i.e., no conversion). The
+        special value 'infer' will cause the type to be guessed from the first
+        ten non-null values.
     times: 'int64' (default), or 'int96':
         In "int64" mode, datetimes are written as 8-byte integers, us
         resolution; in "int96" mode, they are written as 12-byte blocks, with
@@ -733,6 +784,8 @@ def write(filename, data, row_group_offsets=50000000,
     --------
     >>> fastparquet.write('myfile.parquet', df)  # doctest: +SKIP
     """
+    if str(has_nulls) == 'infer':
+        has_nulls = None
     sep = sep_from_open(open_with)
     if isinstance(row_group_offsets, int):
         l = len(data)
@@ -740,18 +793,22 @@ def write(filename, data, row_group_offsets=50000000,
         chunksize = max(min((l - 1) // nparts + 1, l), 1)
         row_group_offsets = list(range(0, l, chunksize))
     if write_index or write_index is None and index_like(data.index):
+        cols = set(data)
         data = data.reset_index()
+        index_cols = [c for c in data if c not in cols]
+    else:
+        index_cols = []
     check_column_names(data.columns, partition_on, fixed_text, object_encoding,
                        has_nulls)
     ignore = partition_on if file_scheme != 'simple' else []
     fmd = make_metadata(data, has_nulls=has_nulls, ignore_columns=ignore,
                         fixed_text=fixed_text, object_encoding=object_encoding,
-                        times=times)
+                        times=times, index_cols=index_cols)
 
     if file_scheme == 'simple':
         write_simple(filename, data, fmd, row_group_offsets,
                      compression, open_with, has_nulls, append)
-    elif file_scheme == 'hive':
+    elif file_scheme in ['hive', 'drill']:
         if append:
             pf = api.ParquetFile(filename, open_with=open_with)
             if pf.file_scheme != 'hive':
@@ -769,20 +826,20 @@ def write(filename, data, row_group_offsets=50000000,
                    else None)
             part = 'part.%i.parquet' % (i + i_offset)
             if partition_on:
-                partition_on_columns(
+                rgs = partition_on_columns(
                     data[start:end], partition_on, filename, part, fmd,
-                    sep, compression, open_with, mkdirs
+                    sep, compression, open_with, mkdirs,
+                    with_field=file_scheme == 'hive'
                 )
-                rg = None
+                fmd.row_groups.extend(rgs)
             else:
                 partname = sep.join([filename, part])
                 with open_with(partname, 'wb') as f2:
                     rg = make_part_file(f2, data[start:end], fmd.schema,
-                                        compression=compression)
+                                        compression=compression, fmd=fmd)
                 for chunk in rg.columns:
                     chunk.file_path = part
 
-            if rg is not None:
                 fmd.row_groups.append(rg)
 
         write_common_metadata(fn, fmd, open_with, no_row_groups=False)
@@ -807,7 +864,7 @@ def find_max_part(row_groups):
 
 
 def partition_on_columns(data, columns, root_path, partname, fmd, sep,
-                         compression, open_with, mkdirs):
+                         compression, open_with, mkdirs, with_field=True):
     """
     Split each row-group by the given columns
 
@@ -818,20 +875,27 @@ def partition_on_columns(data, columns, root_path, partname, fmd, sep,
     remaining = list(data)
     for column in columns:
         remaining.remove(column)
+    rgs = []
     for key in gb.indices:
         df = gb.get_group(key)[remaining]
-        path = sep.join(["%s=%s" % (name, val)
-                         for name, val in zip(columns, key)])
+        if not isinstance(key, tuple):
+            key = (key,)
+        if with_field:
+            path = sep.join(["%s=%s" % (name, val)
+                             for name, val in zip(columns, key)])
+        else:
+            path = sep.join(["%s" % val for val in key])
         relname = sep.join([path, partname])
         mkdirs(root_path + sep + path)
         fullname = sep.join([root_path, path, partname])
         with open_with(fullname, 'wb') as f2:
             rg = make_part_file(f2, df, fmd.schema,
-                                compression=compression)
+                                compression=compression, fmd=fmd)
         if rg is not None:
             for chunk in rg.columns:
                 chunk.file_path = relname
-            fmd.row_groups.append(rg)
+            rgs.append(rg)
+    return rgs
 
 
 def write_common_metadata(fn, fmd, open_with=default_open,
