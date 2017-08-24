@@ -5,7 +5,6 @@ import struct
 
 import numpy as np
 import pandas as pd
-from thriftpy.protocol.compact import TCompactProtocol
 
 from . import encoding
 from .compression import decompress_data
@@ -14,14 +13,17 @@ from .schema import _is_list_like, _is_map_like
 from .speedups import unpack_byte_array
 from .thrift_structures import parquet_thrift
 from .util import val_to_num, byte_buffer, ex_from_sep
+from .compact import read_thrift as read_thrift_acc
+from .compact import bytesIO
 
 
 def read_thrift(file_obj, ttype):
     """Read a thrift structure from the given fo."""
-    pin = TCompactProtocol(file_obj, True)
-    page_header = ttype()
-    page_header.read(pin)
-    return page_header
+    i = file_obj.tell()
+    b = bytesIO(file_obj.read())
+    out = read_thrift_acc(ttype, b)
+    file_obj.seek(i + b.tell())
+    return out
 
 
 def _read_page(file_obj, page_header, column_metadata):
