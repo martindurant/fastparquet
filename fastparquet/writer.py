@@ -502,10 +502,16 @@ def write_column(f, data, selement, compression=None):
         try:
             if num_nulls == 0:
                 max, min = data.values.max(), data.values.min()
-                max = encode['PLAIN'](pd.Series([max]), selement)
-                min = encode['PLAIN'](pd.Series([min]), selement)
+                if selement.type == parquet_thrift.Type.BYTE_ARRAY:
+                    if selement.converted_type is not None:
+                        max = encode['PLAIN'](pd.Series([max]), selement)[4:]
+                        min = encode['PLAIN'](pd.Series([min]), selement)[4:]
+                else:
+                    max = encode['PLAIN'](pd.Series([max]), selement)
+                    min = encode['PLAIN'](pd.Series([min]), selement)
         except TypeError:
             pass
+        ncats = len(data.cat.categories)
         data = data.cat.codes
         cats = True
         encoding = "PLAIN_DICTIONARY"
@@ -519,8 +525,13 @@ def write_column(f, data, selement, compression=None):
     try:
         if encoding != 'PLAIN_DICTIONARY' and num_nulls == 0:
             max, min = data.values.max(), data.values.min()
-            max = encode['PLAIN'](pd.Series([max], dtype=data.dtype), selement)
-            min = encode['PLAIN'](pd.Series([min], dtype=data.dtype), selement)
+            if selement.type == parquet_thrift.Type.BYTE_ARRAY:
+                if selement.converted_type is not None:
+                    max = encode['PLAIN'](pd.Series([max]), selement)[4:]
+                    min = encode['PLAIN'](pd.Series([min]), selement)[4:]
+            else:
+                max = encode['PLAIN'](pd.Series([max]), selement)
+                min = encode['PLAIN'](pd.Series([min]), selement)
     except TypeError:
         pass
 
@@ -575,6 +586,10 @@ def write_column(f, data, selement, compression=None):
                 page_type=parquet_thrift.PageType.DICTIONARY_PAGE,
                 encoding=parquet_thrift.Encoding.PLAIN, count=1))
         cmd.dictionary_page_offset = dict_start
+        cmd.key_value_metadata.append(
+            parquet_thrift.KeyValue(key='num_categories', value=str(ncats)))
+        cmd.key_value_metadata.append(
+            parquet_thrift.KeyValue(key='numpy_dtype', value=str(data.dtype)))
     chunk = parquet_thrift.ColumnChunk(file_offset=offset,
                                        meta_data=cmd)
     write_thrift(f, chunk)
@@ -674,7 +689,7 @@ def make_metadata(data, has_nulls=True, ignore_columns=[], fixed_text=None,
             se.repetition_type = parquet_thrift.FieldRepetitionType.OPTIONAL
         fmd.schema.append(se)
         root.num_children += 1
-    meta.value = json.dumps(pandas_metadata)
+    meta.value = json.dumps(pandas_metadata, sort_keys=True)
     return fmd
 
 
@@ -685,7 +700,7 @@ def write_simple(fn, data, fmd, row_group_offsets, compression,
     """
     if append:
         pf = api.ParquetFile(fn, open_with=open_with)
-        if pf.file_scheme != 'simple':
+        if pf.file_scheme not in ['simple', 'empty']:
             raise ValueError('File scheme requested is simple, but '
                              'existing file scheme is not')
         fmd = pf.fmd
@@ -811,9 +826,9 @@ def write(filename, data, row_group_offsets=50000000,
     elif file_scheme in ['hive', 'drill']:
         if append:
             pf = api.ParquetFile(filename, open_with=open_with)
-            if pf.file_scheme != 'hive':
-                raise ValueError('Requested file scheme is hive, '
-                                 'but existing file scheme is not.')
+            if pf.file_scheme not in ['hive', 'empty']:
+                raise ValueError('Requested file scheme is %s, but '
+                                 'existing file scheme is not.' % file_scheme)
             fmd = pf.fmd
             i_offset = find_max_part(fmd.row_groups)
             partition_on = list(pf.cats)
@@ -875,6 +890,8 @@ def partition_on_columns(data, columns, root_path, partname, fmd, sep,
     remaining = list(data)
     for column in columns:
         remaining.remove(column)
+    if not remaining:
+        raise ValueError("Cannot include all columns in partition_on")
     rgs = []
     for key in gb.indices:
         df = gb.get_group(key)[remaining]
@@ -915,6 +932,7 @@ def write_common_metadata(fn, fmd, open_with=default_open,
         Strip out row groups from metadata before writing - used for "common
         metadata" files, containing only the schema.
     """
+    consolidate_categories(fmd)
     with open_with(fn, 'wb') as f:
         f.write(MARKER)
         if no_row_groups:
@@ -928,7 +946,26 @@ def write_common_metadata(fn, fmd, open_with=default_open,
         f.write(MARKER)
 
 
-def merge(file_list, verify_schema=True, open_with=default_open):
+def consolidate_categories(fmd):
+    key_value = [k for k in fmd.key_value_metadata
+                 if k.key == 'pandas'][0]
+    meta = json.loads(key_value.value)
+    cats = [c for c in meta['columns']
+            if 'num_categories' in (c['metadata'] or [])]
+    for cat in cats:
+        for rg in fmd.row_groups:
+            for col in rg.columns:
+                if ".".join(col.meta_data.path_in_schema) == cat['name']:
+                    ncats = [k.value for k in col.meta_data.key_value_metadata
+                             if k.key == 'num_categories']
+                    if ncats and int(ncats[0]) > cat['metadata'][
+                            'num_categories']:
+                        cat['metadata']['num_categories'] = int(ncats[0])
+    key_value.value = json.dumps(meta, sort_keys=True)
+
+
+def merge(file_list, verify_schema=True, open_with=default_open,
+          root=False):
     """
     Create a logical data-set out of multiple parquet files.
 
@@ -946,13 +983,18 @@ def merge(file_list, verify_schema=True, open_with=default_open):
     open_with: func
         Used for opening a file for writing as f(path, mode). If input list
         is ParquetFile instances, will be inferred from the first one of these.
+    root: str
+        If passing a list of files, the top directory of the data-set may
+        be ambiguous for partitioning where the upmost field has only one
+        value. Use this to specify the data'set root directory, if required.
 
     Returns
     -------
     ParquetFile instance corresponding to the merged data.
     """
     sep = sep_from_open(open_with)
-    basepath, fmd = metadata_from_many(file_list, verify_schema, open_with)
+    basepath, fmd = metadata_from_many(file_list, verify_schema, open_with,
+                                       root=root)
 
     out_file = sep.join([basepath, '_metadata'])
     write_common_metadata(out_file, fmd, open_with, no_row_groups=False)

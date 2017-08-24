@@ -43,14 +43,15 @@ def default_open(f, mode='rb'):
 
 
 def val_to_num(x):
-    # What about ast.literal_eval?
+    if x in ['NOW', 'TODAY']:
+        return x
     try:
         return ast.literal_eval(x)
-    except ValueError:
+    except:
         pass
     try:
         return pd.to_datetime(x)
-    except ValueError:
+    except:
         pass
     try:
         return pd.to_timedelta(x)
@@ -136,7 +137,8 @@ def byte_buffer(raw_bytes):
     return buffer(raw_bytes) if PY2 else memoryview(raw_bytes)
 
 
-def metadata_from_many(file_list, verify_schema=False, open_with=default_open):
+def metadata_from_many(file_list, verify_schema=False, open_with=default_open,
+                       root=False):
     """
     Given list of parquet files, make a FileMetaData that points to them
 
@@ -147,6 +149,9 @@ def metadata_from_many(file_list, verify_schema=False, open_with=default_open):
         Whether to assert that the schemas in each file are identical
     open_with: function
         Use this to open each path.
+    root: str
+        Top of the dataset's directory tree, for cases where it can't be
+        automatically inferred.
 
     Returns
     -------
@@ -162,7 +167,7 @@ def metadata_from_many(file_list, verify_schema=False, open_with=default_open):
         pfs = [api.ParquetFile(fn, open_with=open_with) for fn in file_list]
     else:
         raise ValueError("Merge requires all PaquetFile instances or none")
-    basepath, file_list = analyse_paths(file_list, sep)
+    basepath, file_list = analyse_paths(file_list, sep, root=root)
 
     if verify_schema:
         for pf in pfs[1:]:
@@ -173,7 +178,9 @@ def metadata_from_many(file_list, verify_schema=False, open_with=default_open):
     fmd.row_groups = []
 
     for pf, fn in zip(pfs, file_list):
-        if pf.file_scheme != 'simple':
+        if pf.file_scheme not in ['simple', 'empty']:
+            # should remove 'empty' datasets up front? Get ignored on load
+            # anyway.
             raise ValueError('Cannot merge multi-file input', fn)
         for rg in pf.row_groups:
             rg = thrift_copy(rg)
@@ -192,32 +199,40 @@ def ex_from_sep(sep):
     """Generate regex for category folder matching"""
     if sep not in seps:
         if sep in r'\^$.|?*+()[]':
-            s = re.compile(r"([a-zA-Z_]+)=([^\{}]+)".format(sep))
+            s = re.compile(r"([a-zA-Z_0-9]+)=([^\{}]+)".format(sep))
         else:
-            s = re.compile("([a-zA-Z_]+)=([^{}]+)".format(sep))
+            s = re.compile("([a-zA-Z_0-9]+)=([^{}]+)".format(sep))
         seps[sep] = s
     return seps[sep]
 
 
-def analyse_paths(file_list, sep=os.sep):
+def analyse_paths(file_list, sep=os.sep, root=False):
     """Consolidate list of file-paths into acceptable parquet relative paths"""
     path_parts_list = [fn.split(sep) for fn in file_list]
     if len({len(path_parts) for path_parts in path_parts_list}) > 1:
         raise ValueError('Mixed nesting in merge files')
-    basepath = path_parts_list[0][:-1]
     s = ex_from_sep(sep)
-    out_list = []
-    for i, path_parts in enumerate(path_parts_list):
-        j = len(path_parts) - 1
-        for k, (base_part, path_part) in enumerate(zip(basepath, path_parts)):
-            if base_part != path_part:
-                j = k
-                break
-        basepath = basepath[:j]
+    if root is False:
+        basepath = path_parts_list[0][:-1]
+        for i, path_parts in enumerate(path_parts_list):
+            j = len(path_parts) - 1
+            for k, (base_part, path_part) in enumerate(zip(basepath, path_parts)):
+                if base_part != path_part:
+                    j = k
+                    break
+            basepath = basepath[:j]
+        l = len(basepath)
+
+    else:
+        basepath = root.split(sep)
+        l = len(basepath)
+        assert all(p[:l] == basepath for p in path_parts_list
+                   ), "All paths must begin with the given root"
     l = len(basepath)
     if len({tuple([p.split('=')[0] for p in parts[l:-1]])
             for parts in path_parts_list}) > 1:
         raise ValueError('Partitioning directories do not agree')
+    out_list = []
     for path_parts in path_parts_list:
         for path_part in path_parts[l:-1]:
             if s.match(path_part) is None:
@@ -270,6 +285,6 @@ def get_column_metadata(column, name):
             'integer': str(dtype),
             'floating': str(dtype),
         }.get(inferred_dtype, inferred_dtype),
-        'numpy_dtype': str(dtype),
+        'numpy_type': str(dtype),
         'metadata': extra_metadata,
     }

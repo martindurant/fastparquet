@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from __future__ import unicode_literals
 
 import datetime
 import numpy as np
@@ -174,13 +175,16 @@ def test_roundtrip_complex(tempdir, scheme,):
     ])
 def test_datetime_roundtrip(tempdir, df, capsys):
     fname = os.path.join(tempdir, 'test.parquet')
-    write(fname, df)
-
+    w = False
+    if 'x' in df and 'Europe/' in str(df.x.dtype.tz):
+        with pytest.warns(UserWarning) as w:
+            write(fname, df)
+    else:
+        write(fname, df)
     r = ParquetFile(fname)
-    out, err = capsys.readouterr()
-    if 'x' in df and str(df.x.dtype.tz) == 'Europe/London':
-        # warning happens first time only
-        assert "UTC" in err
+
+    if w:
+        assert "UTC" in str(w.list[0].message)
 
     df2 = r.to_pandas()
     if 'x' in df:
@@ -347,6 +351,14 @@ def test_empty_groupby(tempdir):
 
     for i, row in out.iterrows():
         assert row.b in list(df[(df.a==row.a)&(df.c==row.c)].b)
+
+
+def test_too_many_partition_columns(tempdir):
+    df = pd.DataFrame({'a': np.random.choice(['a', 'b', 'c'], size=1000),
+                       'c': np.random.choice([True, False], size=1000)})
+    with pytest.raises(ValueError) as ve:
+        writer.write(tempdir, df, partition_on=['a', 'c'], file_scheme='hive')
+    assert "Cannot include all columns" in str(ve)
 
 
 @pytest.mark.parametrize('compression', ['GZIP',
@@ -706,6 +718,23 @@ def test_append_simple(tempdir):
                                        check_categorical=False)
 
 
+@pytest.mark.parametrize('scheme', ('hive', 'simple'))
+def test_append_empty(tempdir, scheme):
+    fn = os.path.join(str(tempdir), 'test.parq')
+    df = pd.DataFrame({'a': [1, 2, 3, 0],
+                       'b': ['a', 'a', 'b', 'b']})
+    write(fn, df.head(0), write_index=False, file_scheme=scheme)
+    pf = ParquetFile(fn)
+    assert pf.count == 0
+    assert pf.file_scheme == 'empty'
+    write(fn, df, append=True, write_index=False, file_scheme=scheme)
+
+    pf = ParquetFile(fn)
+    pd.util.testing.assert_frame_equal(pf.to_pandas(), df,
+                                       check_categorical=False)
+
+
+
 @pytest.mark.parametrize('row_groups', ([0], [0, 2]))
 @pytest.mark.parametrize('partition', ([], ['b']))
 def test_append(tempdir, row_groups, partition):
@@ -769,6 +798,7 @@ def test_empty_dataframe(tempdir):
     assert pf.count == 0
     assert len(out) == 0
     assert (out.columns == df.columns).all()
+    assert pf.statistics
 
 
 def test_hasnulls_ordering(tempdir):
@@ -814,3 +844,19 @@ def test_cats_and_nulls(tempdir):
     out = pf.to_pandas()
     assert out.dtypes['x'] == 'category'
     assert out.x.tolist() == [1, 2, 1]
+
+
+def test_consolidate_cats(tempdir):
+    import json
+    df = pd.DataFrame({'x': pd.Categorical([1, 2, 1])})
+    fn = os.path.join(tempdir, 'temp.parq')
+    write(fn, df)
+    pf = ParquetFile(fn)
+    assert 2 == json.loads(pf.fmd.key_value_metadata[0].value)['columns'][0][
+        'metadata']['num_categories']
+    start = pf.row_groups[0].columns[0].meta_data.key_value_metadata[0].value
+    assert start == '2'
+    pf.row_groups[0].columns[0].meta_data.key_value_metadata[0].value = '5'
+    writer.consolidate_categories(pf.fmd)
+    assert 5 == json.loads(pf.fmd.key_value_metadata[0].value)['columns'][0][
+        'metadata']['num_categories']

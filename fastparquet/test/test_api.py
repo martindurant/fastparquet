@@ -1,3 +1,4 @@
+from __future__ import unicode_literals
 
 import os
 
@@ -70,18 +71,26 @@ def test_empty_statistics(tempdir):
 
 def test_sorted_row_group_columns(tempdir):
     df = pd.DataFrame({'x': [1, 2, 3, 4],
+                       'v': [{'a': 0}, {'b': -1}, {'c': 5}, {'a': 0}],
                        'y': [1.0, 2.0, 1.0, 2.0],
                        'z': ['a', 'b', 'c', 'd']})
 
     fn = os.path.join(tempdir, 'foo.parquet')
-    write(fn, df, row_group_offsets=[0, 2])
+    write(fn, df, row_group_offsets=[0, 2], object_encoding={'v': 'json',
+                                                             'z': 'utf8'})
 
     pf = ParquetFile(fn)
+
+    # string stats should be stored without byte-encoding
+    zcol = [c for c in pf.row_groups[0].columns
+            if c.meta_data.path_in_schema == ['z']][0]
+    assert zcol.meta_data.statistics.min == 'a'
 
     result = sorted_partitioned_columns(pf)
     expected = {'x': {'min': [1, 3], 'max': [2, 4]},
                 'z': {'min': ['a', 'c'], 'max': ['b', 'd']}}
 
+    # NB column v should not feature, as dict are unorderable
     assert result == expected
 
 
@@ -173,12 +182,39 @@ def test_read_multiple_no_metadata(tempdir):
     df = pd.DataFrame({'x': [1, 5, 2, 5]})
     write(tempdir, df, file_scheme='hive', row_group_offsets=[0, 2])
     os.unlink(os.path.join(tempdir, '_metadata'))
+    os.unlink(os.path.join(tempdir, '_common_metadata'))
     import glob
     flist = list(sorted(glob.glob(os.path.join(tempdir, '*'))))
     pf = ParquetFile(flist)
     assert len(pf.row_groups) == 2
     out = pf.to_pandas()
     pd.util.testing.assert_frame_equal(out, df)
+
+
+def test_single_upper_directory(tempdir):
+    df = pd.DataFrame({'x': [1, 5, 2, 5], 'y': ['aa'] * 4})
+    write(tempdir, df, file_scheme='hive', partition_on='y')
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas()
+    assert (out.y == 'aa').all()
+
+    os.unlink(os.path.join(tempdir, '_metadata'))
+    os.unlink(os.path.join(tempdir, '_common_metadata'))
+    import glob
+    flist = list(sorted(glob.glob(os.path.join(tempdir, '*/*'))))
+    pf = ParquetFile(flist, root=tempdir)
+    assert pf.fn == os.path.join(tempdir, '_metadata')
+    out = pf.to_pandas()
+    assert (out.y == 'aa').all()
+
+
+def test_numerical_partition_name(tempdir):
+    df = pd.DataFrame({'x': [1, 5, 2, 5], 'y1': ['aa', 'aa', 'bb', 'aa']})
+    write(tempdir, df, file_scheme='hive', partition_on=['y1'])
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas()
+    assert out[out.y1 == 'aa'].x.tolist() == [1, 5, 5]
+    assert out[out.y1 == 'bb'].x.tolist() == [2]
 
 
 def test_filter_without_paths(tempdir):
@@ -194,3 +230,80 @@ def test_filter_without_paths(tempdir):
     pd.util.testing.assert_frame_equal(out, df)
     out = pf.to_pandas(filters=[['x', '>', 30]])
     assert len(out) == 0
+
+
+def test_filter_special(tempdir):
+    df = pd.DataFrame({
+        'x': [1, 2, 3, 4, 5, 6, 7],
+        'symbol': ['NOW', 'OI', 'OI', 'OI', 'NOW', 'NOW', 'OI']
+    })
+    write(tempdir, df, file_scheme='hive', partition_on=['symbol'])
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas(filters=[('symbol', '==', 'NOW')])
+    assert out.x.tolist() == [1, 5, 6]
+    assert out.symbol.tolist() == ['NOW', 'NOW', 'NOW']
+
+
+def test_in_filter(tempdir):
+    symbols = ['a', 'a', 'b', 'c', 'c', 'd']
+    values = [1, 2, 3, 4, 5, 6]
+    df = pd.DataFrame(data={'symbols': symbols, 'values': values})
+    write(tempdir, df, file_scheme='hive', partition_on=['symbols'])
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas(filters=[('symbols', 'in', ['a', 'c'])])
+    assert set(out.symbols) == {'a', 'c'}
+
+
+def test_in_filter_numbers(tempdir):
+    symbols = ['a', 'a', 'b', 'c', 'c', 'd']
+    values = [1, 2, 3, 4, 5, 6]
+    df = pd.DataFrame(data={'symbols': symbols, 'values': values})
+    write(tempdir, df, file_scheme='hive', partition_on=['values'])
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas(filters=[('values', 'in', ['1', '4'])])
+    assert set(out.symbols) == {'a', 'c'}
+    out = pf.to_pandas(filters=[('values', 'in', [1, 4])])
+    assert set(out.symbols) == {'a', 'c'}
+
+
+def test_filter_stats(tempdir):
+    df = pd.DataFrame({
+        'x': [1, 2, 3, 4, 5, 6, 7],
+    })
+    write(tempdir, df, file_scheme='hive', row_group_offsets=[0, 4])
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas(filters=[('x', '>=', 5)])
+    assert out.x.tolist() == [5, 6, 7]
+
+
+def test_index_not_in_columns(tempdir):
+    df = pd.DataFrame({'a': ['x', 'y', 'z'], 'b': [4, 5, 6]}).set_index('a')
+    write(tempdir, df, file_scheme='hive')
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas(columns=['b'])
+    assert out.index.tolist() == ['x', 'y', 'z']
+    out = pf.to_pandas(columns=['b'], index=False)
+    assert out.index.tolist() == [0, 1, 2]
+
+
+def test_no_index_name(tempdir):
+    df = pd.DataFrame({'__index_level_0__': ['x', 'y', 'z'],
+                       'b': [4, 5, 6]}).set_index('__index_level_0__')
+    write(tempdir, df, file_scheme='hive')
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas()
+    assert out.index.name is None
+    assert out.index.tolist() == ['x', 'y', 'z']
+
+    df = pd.DataFrame({'__index_level_0__': ['x', 'y', 'z'],
+                       'b': [4, 5, 6]})
+    write(tempdir, df, file_scheme='hive')
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas(index='__index_level_0__', columns=['b'])
+    assert out.index.name is None
+    assert out.index.tolist() == ['x', 'y', 'z']
+
+    pf = ParquetFile(tempdir)
+    out = pf.to_pandas()
+    assert out.index.name is None
+    assert out.index.tolist() == [0, 1, 2]
