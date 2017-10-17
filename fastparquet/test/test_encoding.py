@@ -106,3 +106,11 @@ def testWidths():
     assert 7 == fastparquet.encoding.width_from_max_int(127)
     assert 8 == fastparquet.encoding.width_from_max_int(128)
     assert 8 == fastparquet.encoding.width_from_max_int(255)
+
+
+def test_bitpack_dep():
+    b = fastparquet.encoding.Numpy8(
+        np.array([0b00000101, 0b00111001, 0b01110111], dtype=np.uint8))
+    o = fastparquet.encoding.Numpy32(np.empty(8, np.uint32))
+    fastparquet.encoding.read_bitpacked_deprecated(b, 8, 3, o)
+    assert o.data.tolist() == list(range(8))

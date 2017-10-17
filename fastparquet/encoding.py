@@ -97,6 +97,29 @@ def _mask_for_bits(i):  # pragma: no cover
 
 
 @numba.njit(nogil=True)
+def read_bitpacked_deprecated(fobj, count, width, o):
+    """using the deprecated bitpacking encoding."""
+
+    mask = _mask_for_bits(width)
+    word = 0
+    bits_in_word = 0
+    l = len(fobj.data)
+    while o.loc < count and fobj.loc <= l:
+        if bits_in_word >= width:
+            # how many bits over the value is stored
+            offset = (bits_in_word - width)
+
+            # figure out the value
+            value = (word & (mask << offset)) >> offset
+            o.write_byte(value)
+
+            bits_in_word -= width
+        else:
+            word = (word << 8) | fobj.read_byte()
+            bits_in_word += 8
+
+
+@numba.njit(nogil=True)
 def read_bitpacked(file_obj, header, width, o):  # pragma: no cover
     """
     Read values packed into width-bits each (which can be >8)

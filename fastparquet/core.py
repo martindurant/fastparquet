@@ -42,6 +42,15 @@ def read_data(fobj, coding, count, bit_width):
     if coding == parquet_thrift.Encoding.RLE:
         while o.loc < count:
             encoding.read_rle_bit_packed_hybrid(fobj, bit_width, o=o)
+    elif coding == parquet_thrift.Encoding.BIT_PACKED:
+        import parquet
+        out = parquet.encoding.read_bitpacked_deprecated(fobj,
+                                                   len(fobj.data),
+                                                   count,
+                                                   bit_width,
+                                                   False)
+        out = np.array(out, dtype=np.int32)
+        #encoding.read_bitpacked_deprecated(fobj, count, bit_width, o)
     else:
         raise NotImplementedError('Encoding %s' % coding)
     return out
@@ -195,12 +204,6 @@ def read_col(column, schema_helper, infile, use_cat=False,
     ph = read_thrift(infile, parquet_thrift.PageHeader)
 
     dic = None
-    if ph.type == parquet_thrift.PageType.DICTIONARY_PAGE:
-        dic = np.array(read_dictionary_page(infile, schema_helper, ph, cmd))
-        ph = read_thrift(infile, parquet_thrift.PageHeader)
-        dic = convert(dic, se)
-    if grab_dict:
-        return dic
     if use_cat:
         # fastpath skips the check the number of categories hasn't changed.
         # In this case, they may change, if the default RangeIndex was used.
@@ -226,6 +229,15 @@ def read_col(column, schema_helper, infile, use_cat=False,
 
     num = 0
     while True:
+        if ph.type == parquet_thrift.PageType.DICTIONARY_PAGE:
+            if dic is not None and use_cat:
+                raise ValueError('Cannot read as categorical when there are '
+                                 'multiple dictionary pages in a column chunk.')
+            dic = np.array(read_dictionary_page(infile, schema_helper, ph, cmd))
+            ph = read_thrift(infile, parquet_thrift.PageHeader)
+            dic = convert(dic, se)
+            if grab_dict:
+                return dic
         if (selfmade and hasattr(cmd, 'statistics') and
                 getattr(cmd.statistics, 'null_count', 1) == 0):
             skip_nulls = True
