@@ -43,14 +43,7 @@ def read_data(fobj, coding, count, bit_width):
         while o.loc < count:
             encoding.read_rle_bit_packed_hybrid(fobj, bit_width, o=o)
     elif coding == parquet_thrift.Encoding.BIT_PACKED:
-        import parquet
-        out = parquet.encoding.read_bitpacked_deprecated(fobj,
-                                                   len(fobj.data),
-                                                   count,
-                                                   bit_width,
-                                                   False)
-        out = np.array(out, dtype=np.int32)
-        #encoding.read_bitpacked_deprecated(fobj, count, bit_width, o)
+        encoding.read_bitpacked_deprecated(fobj, count, bit_width, o)
     else:
         raise NotImplementedError('Encoding %s' % coding)
     return out
@@ -238,6 +231,7 @@ def read_col(column, schema_helper, infile, use_cat=False,
             dic = convert(dic, se)
             if grab_dict:
                 return dic
+            continue
         if (selfmade and hasattr(cmd, 'statistics') and
                 getattr(cmd.statistics, 'null_count', 1) == 0):
             skip_nulls = True

@@ -9,3 +9,5 @@ dist
 parquet.egg-info
 .idea
 .cached
+*.c
+*.pyd
