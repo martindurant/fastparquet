@@ -917,6 +917,7 @@ def partition_on_columns(data, columns, root_path, partname, fmd,
     be written in structured directories.
     """
     gb = data.groupby(columns)
+    sep = '/'  # internal paths
     remaining = list(data)
     for column in columns:
         remaining.remove(column)
