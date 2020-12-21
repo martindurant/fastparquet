@@ -10,21 +10,15 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import codecs
-import datetime
 import json
 import logging
 import numba
 import numpy as np
-import os
-import pandas as pd
-import struct
-import sys
-from decimal import Decimal
 import binascii
 
+import sys
+
 from .thrift_structures import parquet_thrift
-from .util import PY2
 from .speedups import array_decode_utf8
 
 logger = logging.getLogger('parquet')  # pylint: disable=invalid-name
@@ -113,18 +107,18 @@ def convert(data, se, timestamp96=True):
         else:  # byte-string
             # NB: general but slow method
             # could optimize when data.dtype.itemsize <= 8
-            if PY2:
-                def from_bytes(d):
-                    return int(binascii.b2a_hex(d), 16) if len(d) else 0
-                return np.array([from_bytes(d) * scale_factor for d in data])
-            else:
-                # NB: `from_bytes` may be py>=3.4 only
-                return np.array([int.from_bytes(d, byteorder='big', signed=True) *
-                                 scale_factor for d in data])
+            return np.array([
+                int.from_bytes(
+                    data.data[i:i + 1], byteorder='big', signed=True
+                ) * scale_factor
+                for i in range(len(data))
+            ])
     elif ctype == parquet_thrift.ConvertedType.DATE:
         return (data * DAYS_TO_MILLIS).view('datetime64[ns]')
     elif ctype == parquet_thrift.ConvertedType.TIME_MILLIS:
         out = np.empty(len(data), dtype='int64')
+        if sys.platform == 'win32':
+            data = data.astype('int64')
         time_shift(data, out, 1000000)
         return out.view('timedelta64[ns]')
     elif ctype == parquet_thrift.ConvertedType.TIMESTAMP_MILLIS:

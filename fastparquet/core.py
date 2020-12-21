@@ -1,8 +1,4 @@
-import io
-import os
-import re
-import struct
-
+import warnings
 import numpy as np
 import pandas as pd
 
@@ -11,8 +7,8 @@ from .compression import decompress_data
 from .converted_types import convert, typemap
 from .schema import _is_list_like, _is_map_like
 from .speedups import unpack_byte_array
-from .thrift_structures import parquet_thrift
-from .util import val_to_num, byte_buffer, ex_from_sep
+from .thrift_structures import parquet_thrift, read_thrift
+from .util import val_to_num, ex_from_sep
 from .compact import read_thrift as read_thrift_acc
 from .compact import bytesIO
 
@@ -27,10 +23,14 @@ def read_thrift(file_obj, ttype):
 
 
 def _read_page(file_obj, page_header, column_metadata):
-    """Read the data page from the given file-object and convert it to raw, 
+    """Read the data page from the given file-object and convert it to raw,
     uncompressed bytes (if necessary)."""
     raw_bytes = file_obj.read(page_header.compressed_page_size)
-    raw_bytes = decompress_data(raw_bytes, column_metadata.codec)
+    raw_bytes = decompress_data(
+        raw_bytes,
+        page_header.uncompressed_page_size,
+        column_metadata.codec,
+    )
 
     assert len(raw_bytes) == page_header.uncompressed_page_size, \
         "found {0} raw bytes (expected {1})".format(
@@ -104,7 +104,7 @@ def read_data_page(f, helper, header, metadata, skip_nulls=False,
     """
     daph = header.data_page_header
     raw_bytes = _read_page(f, header, metadata)
-    io_obj = encoding.Numpy8(np.frombuffer(byte_buffer(raw_bytes),
+    io_obj = encoding.Numpy8(np.frombuffer(memoryview(raw_bytes),
                                            dtype=np.uint8))
 
     repetition_levels = read_rep(io_obj, daph, helper, metadata)
@@ -163,8 +163,8 @@ def read_dictionary_page(file_obj, schema_helper, page_header, column_metadata):
     """
     raw_bytes = _read_page(file_obj, page_header, column_metadata)
     if column_metadata.type == parquet_thrift.Type.BYTE_ARRAY:
-        values = unpack_byte_array(raw_bytes,
-                                   page_header.dictionary_page_header.num_values)
+        values = np.array(unpack_byte_array(raw_bytes,
+                          page_header.dictionary_page_header.num_values), dtype='object')
     else:
         width = schema_helper.schema_element(
             column_metadata.path_in_schema).type_length
@@ -203,13 +203,15 @@ def read_col(column, schema_helper, infile, use_cat=False,
 
     dic = None
     if ph.type == parquet_thrift.PageType.DICTIONARY_PAGE:
-        dic = np.array(read_dictionary_page(infile, schema_helper, ph, cmd))
+        dic = read_dictionary_page(infile, schema_helper, ph, cmd)
         ph = read_thrift(infile, parquet_thrift.PageHeader)
         dic = convert(dic, se)
     if grab_dict:
         return dic
-    if use_cat:
-        catdef._categories = pd.Index(dic)
+    if use_cat and dic is not None:
+        # fastpath skips the check the number of categories hasn't changed.
+        # In this case, they may change, if the default RangeIndex was used.
+        catdef._set_categories(pd.Index(dic), fastpath=True)
         if np.iinfo(assign.dtype).max < len(dic):
             raise RuntimeError('Assigned array dtype (%s) cannot accommodate '
                                'number of category labels (%i)' %
@@ -222,15 +224,26 @@ def read_col(column, schema_helper, infile, use_cat=False,
         my_nan = -1
         do_convert = False
     else:
-        if assign.dtype.kind in ['f', 'i']:
+        if assign.dtype.kind in ['f', 'i', 'u']:
             my_nan = np.nan
         elif assign.dtype.kind in ["M", 'm']:
-            my_nan = -9223372036854775808  # int64 version of NaT
+            # GH#489 use a NaT representation compatible with ExtensionArray
+            my_nan = assign.dtype.type("NaT")
         else:
             my_nan = None
 
     num = 0
+    row_idx = 0
     while True:
+        if ph.type == parquet_thrift.PageType.DICTIONARY_PAGE:
+            dic2 = np.array(read_dictionary_page(infile, schema_helper, ph, cmd))
+            dic2 = convert(dic2, se)
+            if use_cat and (dic2 != dic).any():
+                raise RuntimeError("Attempt to read as categorical a column"
+                                   "with multiple dictionary pages.")
+            dic = dic2
+            ph = read_thrift(infile, parquet_thrift.PageHeader)
+            continue
         if (selfmade and hasattr(cmd, 'statistics') and
                 getattr(cmd.statistics, 'null_count', 1) == 0):
             skip_nulls = True
@@ -240,23 +253,23 @@ def read_col(column, schema_helper, infile, use_cat=False,
                                         skip_nulls, selfmade=selfmade)
         if rep is not None and assign.dtype.kind != 'O':  # pragma: no cover
             # this should never get called
-            raise ValueError('Column contains repeated value, must use object'
+            raise ValueError('Column contains repeated value, must use object '
                              'type, but has assumed type: %s' % assign.dtype)
         d = ph.data_page_header.encoding == parquet_thrift.Encoding.PLAIN_DICTIONARY
         if use_cat and not d:
-            raise ValueError('Returning category type requires all chunks to'
-                             'use dictionary encoding; column: %s',
-                             cmd.path_in_schema)
+            if not hasattr(catdef, '_set_categories'):
+                raise ValueError('Returning category type requires all chunks'
+                                 ' to use dictionary encoding; column: %s',
+                                 cmd.path_in_schema)
 
         max_defi = schema_helper.max_definition_level(cmd.path_in_schema)
         if rep is not None:
             null = not schema_helper.is_required(cmd.path_in_schema[0])
             null_val = (se.repetition_type !=
                         parquet_thrift.FieldRepetitionType.REQUIRED)
-            num = encoding._assemble_objects(assign, defi, rep, val, dic, d,
-                                             null, null_val, max_defi)
+            row_idx = 1 + encoding._assemble_objects(assign, defi, rep, val, dic, d,
+                                             null, null_val, max_defi, row_idx)
         elif defi is not None:
-            max_defi = schema_helper.max_definition_level(cmd.path_in_schema)
             part = assign[num:num+len(defi)]
             part[defi != max_defi] = my_nan
             if d and not use_cat:
@@ -267,7 +280,17 @@ def read_col(column, schema_helper, infile, use_cat=False,
                 part[defi == max_defi] = val
         else:
             piece = assign[num:num+len(val)]
-            if d and not use_cat:
+            if use_cat and not d:
+                # only possible for multi-index
+                warnings.warn("Non-categorical multi-index is likely brittle")
+                val = convert(val, se)
+                try:
+                    i = pd.Categorical(val)
+                except:
+                    i = pd.Categorical(val.tolist())
+                catdef._set_categories(pd.Index(i.categories), fastpath=True)
+                piece[:] = i.codes
+            elif d and not use_cat:
                 piece[:] = dic[val]
             elif do_convert:
                 piece[:] = convert(val, se)
@@ -282,11 +305,11 @@ def read_col(column, schema_helper, infile, use_cat=False,
 
 def read_row_group_file(fn, rg, columns, categories, schema_helper, cats,
                         open=open, selfmade=False, index=None, assign=None,
-                        sep=os.sep):
+                        scheme='hive', partition_meta=None):
     with open(fn, mode='rb') as f:
         return read_row_group(f, rg, columns, categories, schema_helper, cats,
                               selfmade=selfmade, index=index, assign=assign,
-                              sep=sep)
+                              scheme=scheme, partition_meta=partition_meta)
 
 
 def read_row_group_arrays(file, rg, columns, categories, schema_helper, cats,
@@ -310,10 +333,9 @@ def read_row_group_arrays(file, rg, columns, categories, schema_helper, cats,
         if name not in columns:
             continue
 
-        use = name in categories if categories is not None else False
-        read_col(column, schema_helper, file, use_cat=use,
+        read_col(column, schema_helper, file, use_cat=name+'-catdef' in out,
                  selfmade=selfmade, assign=out[name],
-                 catdef=out[name+'-catdef'] if use else None)
+                 catdef=out.get(name+'-catdef', None))
 
         if _is_map_like(schema_helper, column):
             if name not in maps:
@@ -329,20 +351,23 @@ def read_row_group_arrays(file, rg, columns, categories, schema_helper, cats,
 
 def read_row_group(file, rg, columns, categories, schema_helper, cats,
                    selfmade=False, index=None, assign=None,
-                   sep=os.sep):
+                   scheme='hive', partition_meta=None):
     """
     Access row-group in a file and read some columns into a data-frame.
     """
+    partition_meta = partition_meta or {}
     if assign is None:
         raise RuntimeError('Going with pre-allocation!')
     read_row_group_arrays(file, rg, columns, categories, schema_helper,
                           cats, selfmade, assign=assign)
 
     for cat in cats:
-        s = ex_from_sep(sep)
-        partitions = s.findall(rg.columns[0].file_path)
-        if not partitions and sep in (rg.columns[0].file_path or ""):
+        if scheme == 'hive':
+            s = ex_from_sep('/')
+            partitions = s.findall(rg.columns[0].file_path)
+        else:
             partitions = [('dir%i' % i, v) for (i, v) in enumerate(
-                rg.columns[0].file_path.split(sep)[:-1])]
-        val = val_to_num([p[1] for p in partitions if p[0] == cat][0])
+                rg.columns[0].file_path.split('/')[:-1])]
+        key, val = [p for p in partitions if p[0] == cat][0]
+        val = val_to_num(val, meta=partition_meta.get(key))
         assign[cat][:] = cats[cat].index(val)

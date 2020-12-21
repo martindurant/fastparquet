@@ -1,23 +1,19 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
-import datetime
 import numpy as np
 import os
 import pandas as pd
-import pandas.util.testing as tm
+import pandas.testing as tm
 from fastparquet import ParquetFile
 from fastparquet import write, parquet_thrift
 from fastparquet import writer, encoding
+from pandas.testing import assert_frame_equal
+from pandas.api.types import CategoricalDtype
 import pytest
-import shutil
-import tempfile
 
-from fastparquet.util import tempdir, default_mkdirs
-from fastparquet.test.util import s3, sql
-from fastparquet.compression import compressions
-
-TEST_DATA = "test-data"
+from fastparquet.util import default_mkdirs
+from fastparquet.test.util import s3, tempdir, sql, TEST_DATA
 
 
 def test_uvarint():
@@ -116,6 +112,7 @@ def test_roundtrip(tempdir, scheme, row_groups, comp):
           compression=comp)
 
     r = ParquetFile(fname)
+    assert r.fmd.num_rows == r.count == 1000
 
     df = r.to_pandas()
 
@@ -123,6 +120,8 @@ def test_roundtrip(tempdir, scheme, row_groups, comp):
 
     for col in r.columns:
         assert (df[col] == data[col]).all()
+        # tests https://github.com/dask/fastparquet/issues/250
+        assert isinstance(data[col][0], type(df[col][0]))
 
 
 def test_bad_coltype(tempdir):
@@ -130,7 +129,7 @@ def test_bad_coltype(tempdir):
     fn = os.path.join(tempdir, 'temp.parq')
     with pytest.raises((ValueError, TypeError)) as e:
         write(fn, df)
-        assert "tuple" in str(e)
+        assert "tuple" in str(e.value)
 
 
 def test_bad_col(tempdir):
@@ -184,11 +183,9 @@ def test_datetime_roundtrip(tempdir, df, capsys):
     r = ParquetFile(fname)
 
     if w:
-        assert "UTC" in str(w.list[0].message)
+        assert any("UTC" in str(wm.message) for wm in w.list)
 
     df2 = r.to_pandas()
-    if 'x' in df:
-        df['x'] = df.x.dt.tz_convert(None)
 
     pd.util.testing.assert_frame_equal(df, df2, check_categorical=False)
 
@@ -206,6 +203,24 @@ def test_nulls_roundtrip(tempdir):
         assert (df[col] == data[col])[~data[col].isnull()].all()
         assert (data[col].isnull() == df[col].isnull()).all()
 
+def test_decimal_roundtrip(tempdir):
+    import decimal
+    def decimal_convert(x):
+        return decimal.Decimal(x)
+
+    fname = os.path.join(tempdir, 'decitemp.parq')
+    data = pd.DataFrame({'f64': np.arange(10000000, 10001000, dtype=np.float64) / 100000,
+                         'f16': np.arange(1000, dtype=np.float16) /10000
+                        })
+    data['f64']=data['f64'].apply(decimal_convert)
+    data['f16']=data['f16'].apply(decimal_convert)
+    writer.write(fname, data)
+
+    r = ParquetFile(fname)
+    df = r.to_pandas()
+    for col in r.columns:
+        assert (data[col] == df[col]).all()
+
 
 def test_make_definitions_with_nulls():
     for _ in range(10):
@@ -214,7 +229,7 @@ def test_make_definitions_with_nulls():
         data = pd.Series(np.random.choice([True, None],
                                           size=np.random.randint(1, 1000)))
         out, d2 = writer.make_definitions(data, False)
-        i = encoding.Numpy8(np.fromstring(out, dtype=np.uint8))
+        i = encoding.Numpy8(np.frombuffer(out, dtype=np.uint8))
         encoding.read_rle_bit_packed_hybrid(i, 1, length=None, o=o)
         out = o.so_far()[:len(data)]
         assert (out == ~data.isnull()).sum()
@@ -234,7 +249,7 @@ def test_make_definitions_without_nulls():
             p += 1
         assert len(out) == 4 + p + 1  # "length", num_count, value
 
-        i = encoding.Numpy8(np.fromstring(out, dtype=np.uint8))
+        i = encoding.Numpy8(np.frombuffer(out, dtype=np.uint8))
         encoding.read_rle_bit_packed_hybrid(i, 1, length=None, o=o)
         out = o.so_far()
         assert (out == ~data.isnull()).sum()
@@ -298,6 +313,7 @@ def test_groups_roundtrip(tempdir, scheme):
 
     r = ParquetFile(tempdir)
     assert r.columns == ['b']
+
     out = r.to_pandas()
     if scheme == 'drill':
         assert set(r.cats) == {'dir0', 'dir1'}
@@ -311,7 +327,7 @@ def test_groups_roundtrip(tempdir, scheme):
                  file_scheme=scheme)
 
     r = ParquetFile(tempdir)
-    assert r.count == sum(~df.a.isnull())
+    assert r.fmd.num_rows == r.count == sum(~df.a.isnull())
     assert len(r.row_groups) == 8
     out = r.to_pandas()
 
@@ -358,7 +374,23 @@ def test_too_many_partition_columns(tempdir):
                        'c': np.random.choice([True, False], size=1000)})
     with pytest.raises(ValueError) as ve:
         writer.write(tempdir, df, partition_on=['a', 'c'], file_scheme='hive')
-    assert "Cannot include all columns" in str(ve)
+    assert "Cannot include all columns" in str(ve.value)
+
+
+def test_read_partitioned_and_write_with_empty_partions(tempdir):
+    df = pd.DataFrame({'a': np.random.choice(['a', 'b', 'c'], size=1000),
+                       'c': np.random.choice([True, False], size=1000)})
+
+    writer.write(tempdir, df, partition_on=['a'], file_scheme='hive')
+    df_filtered = ParquetFile(tempdir).to_pandas(
+                                            filters=[('a', '==', 'b')]
+                                            )
+
+    writer.write(tempdir, df_filtered, partition_on=['a'], file_scheme='hive')
+
+    df_loaded = ParquetFile(tempdir).to_pandas()
+
+    tm.assert_frame_equal(df_filtered, df_loaded, check_categorical=False)
 
 
 @pytest.mark.parametrize('compression', ['GZIP',
@@ -419,7 +451,28 @@ def test_duplicate_columns(tempdir):
     df = pd.DataFrame(np.arange(12).reshape(4, 3), columns=list('aaa'))
     with pytest.raises(ValueError) as e:
         write(fn, df)
-    assert 'duplicate' in str(e)
+    assert 'duplicate' in str(e.value)
+
+
+@pytest.mark.parametrize('cmp', [None, 'gzip'])
+def test_cmd_bytesize(tempdir, cmp):
+    from fastparquet import core
+    fn = os.path.join(tempdir, 'tmp.parq')
+    df = pd.DataFrame({'s': ['a', 'b']}, dtype='category')
+    write(fn, df, compression=cmp)
+    pf = ParquetFile(fn)
+    chunk = pf.row_groups[0].columns[0]
+    cmd = chunk.meta_data
+    csize = cmd.total_compressed_size
+    f = open(fn, 'rb')
+    f.seek(cmd.dictionary_page_offset)
+    ph = core.read_thrift(f, parquet_thrift.PageHeader)
+    c1 = ph.compressed_page_size
+    f.seek(c1, 1)
+    ph = core.read_thrift(f, parquet_thrift.PageHeader)
+    c2 = ph.compressed_page_size
+    f.seek(c2, 1)
+    assert csize == f.tell() - cmd.dictionary_page_offset
 
 
 def test_dotted_column(tempdir):
@@ -518,8 +571,7 @@ def test_auto_null(tempdir):
     test_cols = list(set(df) - set(object_cols)) + ['d']
     fn = os.path.join(tmp, "test.parq")
 
-    with pytest.raises((TypeError, AttributeError)):
-        ## TODO: this should be a nicer error?
+    with pytest.raises(ValueError):
         write(fn, df, has_nulls=False)
 
     write(fn, df, has_nulls=True)
@@ -596,7 +648,17 @@ def test_many_categories(tempdir, n):
     assert (out.index == df.index).all()
     assert (out.y == df.y).all()
 
-
+def test_write_partitioned_with_empty_categories(tempdir):
+    df = pd.DataFrame({
+        'b': np.random.random(size=1000),
+        'a': pd.Series(np.random.choice(['x', 'z'], size=1000)).astype(
+                CategoricalDtype(categories=['x', 'y', 'z'])
+             ),
+    })
+    write(tempdir, df, partition_on=['a'], file_scheme='hive', write_index=True)
+    out = ParquetFile(tempdir).to_pandas()
+    assert_frame_equal(out, df, check_like=True, check_categorical=False, check_names=False)
+    
 def test_autocat(tempdir):
     tmp = str(tempdir)
     fn = os.path.join(tmp, "test.parq")
@@ -606,31 +668,15 @@ def test_autocat(tempdir):
     pf = ParquetFile(fn)
     assert 'o' in pf.categories
     assert pf.categories['o'] == 2
-    assert pf.dtypes['o'] == 'category'
+    assert str(pf.dtypes['o']) == 'category'
     out = pf.to_pandas()
     assert out.dtypes['o'] == 'category'
     out = pf.to_pandas(categories={})
     assert str(out.dtypes['o']) != 'category'
     out = pf.to_pandas(categories=['o'])
-    assert out.dtypes['o'] == 'category'
+    assert out.dtypes['o'].kind == 'O'
     out = pf.to_pandas(categories={'o': 2})
-    assert out.dtypes['o'] == 'category'
-
-    # regression test
-    pf.fmd.key_value_metadata = [parquet_thrift.KeyValue(
-        key='fastparquet.cats', value='{"o": 2}')]
-    pf._set_attrs()
-    assert 'o' in pf.categories
-    assert pf.categories['o'] == 2
-    assert pf.dtypes['o'] == 'category'
-    out = pf.to_pandas()
-    assert out.dtypes['o'] == 'category'
-    out = pf.to_pandas(categories={})
-    assert str(out.dtypes['o']) != 'category'
-    out = pf.to_pandas(categories=['o'])
-    assert out.dtypes['o'] == 'category'
-    out = pf.to_pandas(categories={'o': 2})
-    assert out.dtypes['o'] == 'category'
+    assert out.dtypes['o'].kind == 'O'
 
 
 @pytest.mark.parametrize('row_groups', ([0], [0, 2]))
@@ -696,13 +742,7 @@ def test_merge_fail(tempdir):
 
     with pytest.raises(ValueError) as e:
         writer.merge([fn0, fn1])
-    assert 'schemas' in str(e)
-
-    os.remove(fn1)
-    write(fn1, df0, file_scheme='hive')
-    with pytest.raises(ValueError) as e:
-        writer.merge([fn0, fn1])
-    assert 'multi-file' in str(e)
+    assert 'schemas' in str(e.value)
 
 
 def test_append_simple(tempdir):
@@ -773,20 +813,39 @@ def test_append_fail(tempdir):
     write(fn, df0, file_scheme='hive')
     with pytest.raises(ValueError) as e:
         write(fn, df1, file_scheme='simple', append=True)
-    assert 'existing file scheme' in str(e)
+    assert 'existing file scheme' in str(e.value)
 
     fn2 = os.path.join(fn, 'temp.parq')
     write(fn2, df0, file_scheme='simple')
     with pytest.raises(ValueError) as e:
         write(fn2, df1, file_scheme='hive', append=True)
-    assert 'existing file scheme' in str(e)
+    assert 'existing file scheme' in str(e.value)
+
+
+def test_append_w_partitioning(tempdir):
+    fn = str(tempdir)
+    df = pd.DataFrame({'a': np.random.choice([1, 2, 3], size=50),
+                       'b': np.random.choice(['hello', 'world'], size=50),
+                       'c': np.random.randint(50, size=50)})
+    write(fn, df, file_scheme='hive', partition_on=['a', 'b'])
+    write(fn, df, file_scheme='hive', partition_on=['a', 'b'], append=True)
+    write(fn, df, file_scheme='hive', partition_on=['a', 'b'], append=True)
+    write(fn, df, file_scheme='hive', partition_on=['a', 'b'], append=True)
+    pf = ParquetFile(fn)
+    out = pf.to_pandas()
+    assert len(out) == 200
+    assert sorted(out.a)[::4] == sorted(df.a)
+    with pytest.raises(ValueError):
+        write(fn, df, file_scheme='hive', partition_on=['a'], append=True)
+    with pytest.raises(ValueError):
+        write(fn, df, file_scheme='hive', partition_on=['b', 'a'], append=True)
 
 
 def test_bad_object_encoding(tempdir):
     df = pd.DataFrame({'x': ['a', 'ab']})
     with pytest.raises(ValueError) as e:
         write(str(tempdir), df, object_encoding='utf-8')
-    assert "utf-8" in str(e)
+    assert "utf-8" in str(e.value)
 
 
 def test_empty_dataframe(tempdir):
@@ -860,3 +919,27 @@ def test_consolidate_cats(tempdir):
     writer.consolidate_categories(pf.fmd)
     assert 5 == json.loads(pf.fmd.key_value_metadata[0].value)['columns'][0][
         'metadata']['num_categories']
+
+
+def test_bad_object_encoding(tempdir):
+    df = pd.DataFrame({'a': [b'00']})
+    with pytest.raises(ValueError) as e:
+        write(tempdir, df, file_scheme='hive', object_encoding='utf8')
+    assert "UTF8" in str(e.value)
+    assert "bytes" in str(e.value)
+    assert '"a"' in str(e.value)
+
+    df = pd.DataFrame({'a': [0, "hello", 0]})
+    with pytest.raises(ValueError) as e:
+        write(tempdir, df, file_scheme='hive', object_encoding='int')
+    assert "INT64" in str(e.value)
+    assert "primitive" in str(e.value)
+    assert '"a"' in str(e.value)
+
+def test_object_encoding_int32(tempdir):
+    df = pd.DataFrame({'a': ['15', None, '2']})
+    fn = os.path.join(tempdir, 'temp.parq')
+    write(fn, df, object_encoding={'a': 'int32'})
+    pf = ParquetFile(fn)
+    assert pf._schema[1].type == parquet_thrift.Type.INT32
+    assert not pf.schema.is_required('a')

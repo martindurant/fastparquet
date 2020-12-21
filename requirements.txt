@@ -1,7 +1,4 @@
-pandas
-numba>=0.28
+pandas>=1.1.0
+numba>=0.49
 numpy>=1.11
-thriftpy>=0.3.6
-pytest
-six
-cython
+thrift>=0.11.0

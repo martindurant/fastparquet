@@ -1,8 +1,7 @@
 """
 Native accelerators for Parquet encoding and decoding.
 """
-
-from __future__ import absolute_import
+# cython: c_string_encoding=utf8
 
 cdef extern from "string.h":
     void *memcpy(void *dest, const void *src, size_t n)
@@ -48,7 +47,7 @@ def array_encode_utf8(inp):
     cdef:
         Py_ssize_t i, n
         np.ndarray[object] arr
-        np.ndarray[object] out
+        np.ndarray[object] result
 
     arr = _to_array(inp)
     _check_1d_object_array(arr)
@@ -70,7 +69,7 @@ def array_decode_utf8(inp):
     cdef:
         Py_ssize_t i, n
         np.ndarray[object] arr
-        np.ndarray[object] out
+        np.ndarray[object] result
         object val
 
     arr = _to_array(inp)

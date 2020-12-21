@@ -6,7 +6,6 @@ Requirements
 
 Required:
 
-- python 3
 - numba
 - numpy
 - pandas
@@ -14,8 +13,8 @@ Required:
 
 Optional (compression algorithms; gzip is always available):
 
-- snappy
-- lzo
+- python-snappy
+- python-lzo
 - brotli
 
 Installation

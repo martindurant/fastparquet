@@ -6,14 +6,14 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import datetime
-from decimal import Decimal
+import sys
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from fastparquet import parquet_thrift as pt
 from fastparquet.converted_types import convert
-from fastparquet.util import PY2
 
 
 def test_int32():
@@ -86,7 +86,6 @@ def test_json():
                           schema)[0] == {'foo': ['bar', u'👾']}
 
 
-@pytest.mark.skipif(PY2,reason='BSON unicode may not be supported in Python 2')
 def test_bson():
     """Test bytes representing bson."""
     bson = pytest.importorskip('bson')
@@ -141,11 +140,12 @@ def test_big_decimal():
         scale=1,
         precision=38
     )
+    pad = b'\x00' * 16
     data = np.array([
-    b'', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1e\\',
-    b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1d\\',
-    b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r{',
-    b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x19)'],
+    pad, pad + b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1e\\',
+    pad + b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1d\\',
+    pad + b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r{',
+    pad + b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x19)'],
             dtype='|S32')
     assert np.isclose(convert(data, schema),
                       np.array([0., 777.2, 751.6, 345.1, 644.1])).all()
