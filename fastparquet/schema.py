@@ -156,6 +156,77 @@ class SchemaHelper(object):
         return max_level
 
 
+def _optional(form, key=""):
+    from awkward._v2 import forms
+    return forms.ByteMaskedForm("i8", form, valid_when=True, form_key=key)
+
+
+def _first(d):
+    return list(d.values())[0]
+
+
+def schema_to_awkward(se, topname=""):
+    from .converted_types import simple, complex
+    from awkward._v2 import forms
+
+    stype = simple.get(se.type)
+    ctype = complex.get(se.converted_type)
+    name = se.name
+    fullname = f"{topname}.{name}" if topname else name
+    optional = se.repetition_type == parquet_thrift.FieldRepetitionType.OPTIONAL
+    if not getattr(se, "children", False):
+        # leaf node
+        dtype = str(ctype or stype)
+        if se.type in [parquet_thrift.Type.BYTE_ARRAY, parquet_thrift.Type.FIXED_LEN_BYTE_ARRAY]:
+            # string/bytes
+            forms.NumpyForm("uint8")
+            utf = se.converted_type == parquet_thrift.ConvertedType.UTF8
+            parameters = {"__array__": ["bytestring", "string"][utf]}
+            form = forms.ListOffsetForm(
+                "i32",
+                forms.NumpyForm("uint8"),
+                parameters=parameters,
+                form_key=fullname,
+            )
+        # TODO: other special cases: DECIMAL, etc.
+        elif se.logicalType and se.logical_type.UNKNOWN is not None:
+            # null
+            form = forms.EmptyForm(form_key=fullname)
+        elif dtype == "M8[ns]" and se.logical_type:
+            # timestamp
+            unit = se.logical_type.TIMESTAMP.unit
+            if unit.MicroSeconds:
+                dtype = "M8[us]"
+            elif unit.MilliSeconds:
+                dtype = "M8[ms]"
+            form = forms.numpyform.NumpyForm(dtype, form_key=fullname)
+        else:
+            # any other number type
+            form = forms.numpyform.NumpyForm(dtype, form_key=fullname)
+
+    elif se.converted_type == parquet_thrift.ConvertedType.LIST:
+        # list
+        if _first(se.children).repetition_type == parquet_thrift.FieldRepetitionType.REPEATED:
+            child = _first(_first(se.children).children)
+            optional = True
+        else:
+            # required list type (rare)
+            child = _first(se.children)
+        form = forms.ListOffsetForm("i32", schema_to_awkward(child, topname=fullname), form_key=fullname)
+    elif se.repetition_type == parquet_thrift.FieldRepetitionType.REPEATED:
+        # a repeated field not marked as a LIST - probably doesn't happen
+        raise NotImplementedError
+    else:
+        # not a leaf, not a list: must be a struct
+        contents = [schema_to_awkward(child, topname=fullname) for child in se.children.values()]
+        names = [child.name for child in se.children.values()]
+        form = forms.RecordForm(contents, names)
+    if optional:
+        return _optional(form, key=fullname)
+    else:
+        return form
+
+
 def _is_list_like(helper, column):
     if len(column.meta_data.path_in_schema) < 3:
         return False

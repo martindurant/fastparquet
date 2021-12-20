@@ -8,7 +8,7 @@ but they're not necessarily the most performant.
 
 import logging
 import numpy as np
-import pandas as pd
+from .imports import pd
 
 from . import parquet_thrift
 from .cencoding import time_shift
@@ -62,28 +62,32 @@ complex = {
     parquet_thrift.ConvertedType.TIME_MICROS: np.dtype('<m8[ns]'),
     parquet_thrift.ConvertedType.TIMESTAMP_MICROS: np.dtype('<M8[ns]')
 }
-nullable = {
-    np.dtype('int8'): pd.Int8Dtype(),
-    np.dtype('int16'): pd.Int16Dtype(),
-    np.dtype('int32'): pd.Int32Dtype(),
-    np.dtype('int64'): pd.Int64Dtype(),
-    np.dtype('uint8'): pd.UInt8Dtype(),
-    np.dtype('uint16'): pd.UInt16Dtype(),
-    np.dtype('uint32'): pd.UInt32Dtype(),
-    np.dtype('uint64'): pd.UInt64Dtype(),
-    np.dtype('bool'): pd.BooleanDtype()
-}
-pandas_nullable = {
-    "Int8": pd.Int8Dtype(),
-    "Int16": pd.Int16Dtype(),
-    "Int32": pd.Int32Dtype(),
-    "Int64": pd.Int64Dtype(),
-    "UInt8": pd.UInt8Dtype(),
-    "UInt16": pd.UInt16Dtype(),
-    "UInt32": pd.UInt32Dtype(),
-    "UInt64": pd.UInt64Dtype(),
-    "boolean": pd.BooleanDtype()
-}
+if not getattr(pd, "dummy", False):
+    nullable = {
+        np.dtype('int8'): pd.Int8Dtype(),
+        np.dtype('int16'): pd.Int16Dtype(),
+        np.dtype('int32'): pd.Int32Dtype(),
+        np.dtype('int64'): pd.Int64Dtype(),
+        np.dtype('uint8'): pd.UInt8Dtype(),
+        np.dtype('uint16'): pd.UInt16Dtype(),
+        np.dtype('uint32'): pd.UInt32Dtype(),
+        np.dtype('uint64'): pd.UInt64Dtype(),
+        np.dtype('bool'): pd.BooleanDtype()
+    }
+    pandas_nullable = {
+        "Int8": pd.Int8Dtype(),
+        "Int16": pd.Int16Dtype(),
+        "Int32": pd.Int32Dtype(),
+        "Int64": pd.Int64Dtype(),
+        "UInt8": pd.UInt8Dtype(),
+        "UInt16": pd.UInt16Dtype(),
+        "UInt32": pd.UInt32Dtype(),
+        "UInt64": pd.UInt64Dtype(),
+        "boolean": pd.BooleanDtype()
+    }
+else:
+    nullable = {}
+    pandas_nullable = {}
 
 
 def _logical_to_time_dtype(logical_timestamp_type):
@@ -167,7 +171,6 @@ def convert(data, se, timestamp96=True):
     if ctype == parquet_thrift.ConvertedType.UTF8:
         if data.dtype != "O" or (len(data) == 1 and not isinstance(data[0], str)):
             # fixed string
-            import pandas as pd
             return pd.Series(data).str.decode("utf8").values
         # already converted in speedups.unpack_byte_array
         return data

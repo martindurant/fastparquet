@@ -7,7 +7,7 @@ import struct
 import numpy as np
 import fsspec
 from fastparquet.util import join_path
-import pandas as pd
+from .imports import pd
 
 from . import core, schema, converted_types, encoding, dataframe
 from . import parquet_thrift
@@ -714,7 +714,6 @@ selection does not match number of rows in DataFrame.')
 
     def _dtypes(self, categories=None):
         """ Implied types of the columns in the schema """
-        import pandas as pd
         if not hasattr(self, "_base_dtype"):
             if self.has_pandas_metadata:
                 md = self.pandas_metadata['columns']

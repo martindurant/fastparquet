@@ -9,7 +9,7 @@ import warnings
 from bisect import bisect
 
 import numpy as np
-import pandas as pd
+from .imports import pd
 from pandas.core.arrays.masked import BaseMaskedDtype
 
 from fastparquet.util import join_path
@@ -18,10 +18,7 @@ from pandas.api.types import is_categorical_dtype
 from . import parquet_thrift
 from .compression import compress_data
 from .converted_types import tobson
-from .util import (default_open, default_mkdirs,
-                   check_column_names, metadata_from_many, created_by,
-                   get_column_metadata, path_string)
-from . import encoding, api, __version__
+from . import api, __version__
 from .util import (default_open, default_mkdirs, check_column_names,
                    created_by, get_column_metadata, path_string, norm_col_name)
 from .speedups import array_encode_utf8, pack_byte_array
@@ -65,17 +62,18 @@ revmap = {parquet_thrift.Type.INT32: np.int32,
           parquet_thrift.Type.FLOAT: np.float32,
           parquet_thrift.Type.DOUBLE: np.float64}
 
-pdoptional_to_numpy_typemap = {
-    pd.Int8Dtype(): np.int8,
-    pd.Int16Dtype(): np.int16,
-    pd.Int32Dtype(): np.int32,
-    pd.Int64Dtype(): np.int64,
-    pd.UInt8Dtype(): np.uint8,
-    pd.UInt16Dtype(): np.uint16,
-    pd.UInt32Dtype(): np.uint32,
-    pd.UInt64Dtype(): np.uint64,
-    pd.BooleanDtype(): bool
-}
+if not getattr(pd, "dummy", False):
+    pdoptional_to_numpy_typemap = {
+        pd.Int8Dtype(): np.int8,
+        pd.Int16Dtype(): np.int16,
+        pd.Int32Dtype(): np.int32,
+        pd.Int64Dtype(): np.int64,
+        pd.UInt8Dtype(): np.uint8,
+        pd.UInt16Dtype(): np.uint16,
+        pd.UInt32Dtype(): np.uint32,
+        pd.UInt64Dtype(): np.uint64,
+        pd.BooleanDtype(): bool
+    }
 
 
 def find_type(data, fixed_text=None, object_encoding=None, times='int64'):

@@ -5,15 +5,13 @@ import numpy as np
 import os
 import os.path
 import operator
-import pandas as pd
+from .imports import pd
 import re
 import numbers
 from collections import defaultdict
 from distutils.version import LooseVersion
 from functools import lru_cache
 import pandas
-
-from pandas.api.types import is_categorical_dtype
 
 PANDAS_VERSION = LooseVersion(pandas.__version__)
 created_by = "fastparquet-python version 1.0.0 (build 111)"
@@ -304,7 +302,7 @@ def get_column_metadata(column, name):
         # pandas accidentally calls this "boolean"
         inferred_dtype = "bool"
 
-    if is_categorical_dtype(dtype):
+    if pd.api.types.is_categorical_dtype(dtype):
         extra_metadata = {
             'num_categories': len(column.cat.categories),
             'ordered': column.cat.ordered,
@@ -356,7 +354,7 @@ def get_column_metadata(column, name):
 
 
 def get_numpy_type(dtype):
-    if is_categorical_dtype(dtype):
+    if pd.api.types.is_categorical_dtype(dtype):
         return 'category'
     elif "Int" in str(dtype):
         return str(dtype).lower()

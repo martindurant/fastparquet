@@ -1,6 +1,5 @@
-import warnings
 import numpy as np
-import pandas as pd
+from .imports import pd
 
 from . import encoding
 from . encoding import read_plain
