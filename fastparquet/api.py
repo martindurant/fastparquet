@@ -766,6 +766,12 @@ selection does not match number of rows in DataFrame.')
         self.dtypes = dtype
         return dtype
 
+    @property
+    def ak_schema(self):
+        """awkward form for the schema"""
+        # TODO: add cats
+        return schema.schema_to_awkward(self.schema.root)
+
     def __getstate__(self):
         return {"fn": self.fn, "open": self.open, "fmd": self.fmd,
                 "pandas_nulls": self.pandas_nulls}

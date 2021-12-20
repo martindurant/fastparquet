@@ -1,3 +1,4 @@
+import importlib
 
 
 class NotImported:
@@ -11,13 +12,9 @@ class NotImported:
         raise AttributeError(item) from self.err
 
 
-try:
-    import pandas as pd
-except ImportError as ex:
-    pd = NotImported(ex)
-
-
-try:
-    import awkward as ak
-except ImportError as ex:
-    ak = NotImported(ex)
+def __getattr__(name):
+    try:
+        mod = importlib.import_module(name)
+    except ImportError as ex:
+        mod = NotImported(ex)
+    globals()[name] = mod
