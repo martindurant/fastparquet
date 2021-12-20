@@ -12,7 +12,6 @@ class NotImported:
 
 
 try:
-    raise ImportError
     import pandas as pd
 except ImportError as ex:
     pd = NotImported(ex)
